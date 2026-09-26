@@ -10,6 +10,7 @@ from unidecode import unidecode
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     ApplicationBuilder,
+    ApplicationHandlerStop,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
@@ -163,7 +164,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 **Xin chào! Tôi là Bot Lưu Trữ & Tìm Kiếm Tài Liệu.**\n\n"
         "📥 **Cách upload:** Gửi/chuyển tiếp File, Ảnh, Video, Audio, Voice hoặc bất kỳ link nào "
         "(Canva, Drive, YouTube...) vào đây.\n"
-        "🔁 *Upload nhiều file cùng chủ đề? Bot sẽ tự gợi ý dùng lại, khỏi gõ lại nhiều lần!*\n\n"
+        "📸 *Gửi NHIỀU ảnh/file cùng lúc (dạng album)? Bot chỉ hỏi chủ đề 1 LẦN cho cả lô!*\n"
+        "🔁 *Upload nhiều lần cùng chủ đề? Bot sẽ tự gợi ý dùng lại, khỏi gõ lại nhiều lần!*\n\n"
         "🔍 **Cách tìm kiếm:** Dùng lệnh `/tim <từ khóa>` (VD: `/tim de thi giua ky`) — "
         "bot gửi luôn TOÀN BỘ ảnh/file liên quan.\n"
         "📜 Gõ `/help` để xem danh sách đầy đủ các lệnh.",
@@ -185,8 +187,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 **Khác:**\n"
         "• `/stats`: Xem thống kê kho tài liệu\n"
         "• `/cancel`: Hủy thao tác hiện tại\n\n"
-        "💡 **Mẹo:** Upload nhiều file liên tiếp cùng 1 chủ đề? Bot sẽ tự nhớ và gợi ý "
-        "\"Dùng lại chủ đề vừa rồi?\" — chỉ cần bấm 1 nút!"
+        "💡 **Mẹo:**\n"
+        "• Gửi nhiều ảnh/file cùng lúc (album) → bot chỉ hỏi chủ đề **1 lần** cho cả lô.\n"
+        "• Upload liên tiếp cùng chủ đề → bot tự nhớ và gợi ý \"Dùng lại chủ đề vừa rồi?\" — bấm 1 nút là xong!"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -194,13 +197,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==============================================================================
 # 5. QUY TRÌNH UPLOAD TÀI LIỆU (CONVERSATION HANDLER)
 # ==============================================================================
-def _build_subject_keyboard() -> InlineKeyboardMarkup:
-    """Tạo bàn phím chọn môn học, có emoji cho trực quan."""
+def _build_subject_keyboard(prefix: str = "sub_") -> InlineKeyboardMarkup:
+    """Tạo bàn phím chọn môn học, có emoji cho trực quan.
+    `prefix` khác nhau giữa flow upload đơn ('sub_') và flow upload theo lô ('batchsub_')."""
     buttons = []
     row = []
     for idx, sub in enumerate(SUBJECTS, start=1):
         emoji = SUBJECT_EMOJI.get(sub, "📁")
-        row.append(InlineKeyboardButton(f"{emoji} {sub}", callback_data=f"sub_{sub}"))
+        row.append(InlineKeyboardButton(f"{emoji} {sub}", callback_data=f"{prefix}{sub}"))
         if idx % 2 == 0:
             buttons.append(row)
             row = []
@@ -389,6 +393,230 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _clear_upload_temp(context.user_data)
     await update.message.reply_text("❌ Đã hủy thao tác lưu tài liệu.")
     return ConversationHandler.END
+
+
+# ==============================================================================
+# 5B. UPLOAD THEO LÔ (gửi nhiều ảnh/file cùng lúc — hỏi chủ đề 1 LẦN DUY NHẤT)
+# ==============================================================================
+# Thời gian (giây) bot chờ để gom đủ các phần của 1 album trước khi hỏi chủ đề.
+# Telegram thường gửi các ảnh trong cùng 1 album cách nhau chưa tới 1 giây.
+ALBUM_COLLECT_DELAY = 1.5
+
+
+async def route_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Chạy TRƯỚC ConversationHandler (group=-1). Nếu tin nhắn là 1 phần của album
+    (nhiều ảnh/file gửi cùng lúc, có chung media_group_id), gom vào bộ đệm và
+    chặn không cho ConversationHandler xử lý riêng từng ảnh (tránh hỏi chủ đề
+    lặp lại nhiều lần). Nếu KHÔNG phải album, bỏ qua để flow upload đơn lẻ
+    (start_upload) xử lý như bình thường.
+    """
+    message = update.message
+    if not message or not message.media_group_id:
+        return  # Không phải album -> để flow upload đơn xử lý
+
+    if message.document:
+        file_type, file_id = "document", message.document.file_id
+    elif message.photo:
+        file_type, file_id = "photo", message.photo[-1].file_id
+    elif message.video:
+        file_type, file_id = "video", message.video.file_id
+    elif message.audio:
+        file_type, file_id = "audio", message.audio.file_id
+    else:
+        return
+
+    mgid = message.media_group_id
+    buffers = context.chat_data.setdefault("album_buffers", {})
+    entry = buffers.setdefault(mgid, {"items": [], "user_id": message.from_user.id})
+    entry["items"].append({
+        "file_type": file_type,
+        "file_id": file_id,
+        "message_id": message.message_id,
+    })
+
+    # Đặt lại hẹn giờ mỗi khi có thêm 1 phần của album đến, để đảm bảo
+    # đợi đủ TẤT CẢ các phần rồi mới xử lý (tránh xử lý dở dang).
+    job_name = f"album_{message.chat_id}_{mgid}"
+    if context.job_queue:
+        for job in context.job_queue.get_jobs_by_name(job_name):
+            job.schedule_removal()
+        context.job_queue.run_once(
+            process_album_job,
+            when=ALBUM_COLLECT_DELAY,
+            chat_id=message.chat_id,
+            user_id=message.from_user.id,
+            name=job_name,
+            data={"media_group_id": mgid},
+        )
+
+    # Chặn không cho các handler khác (ConversationHandler) xử lý riêng ảnh này
+    raise ApplicationHandlerStop
+
+
+async def process_album_job(context: ContextTypes.DEFAULT_TYPE):
+    """Chạy sau khi đã gom đủ các phần của 1 album — hỏi chủ đề 1 LẦN cho cả lô."""
+    job = context.job
+    mgid = job.data["media_group_id"]
+
+    buffers = context.chat_data.get("album_buffers", {})
+    entry = buffers.pop(mgid, None)
+    if not entry or not entry["items"]:
+        return
+
+    items = entry["items"]
+    count = len(items)
+
+    context.user_data["batch_items"] = items
+    context.user_data["batch_stage"] = "select_subject"
+
+    # Nếu vừa lưu 1 chủ đề gần đây, gợi ý dùng lại luôn cho CẢ LÔ
+    last_subject = context.user_data.get("last_subject")
+    last_topic = context.user_data.get("last_topic")
+    last_time = context.user_data.get("last_topic_time")
+
+    if last_subject and last_topic and last_time and (time.time() - last_time) <= REUSE_TOPIC_WINDOW:
+        emoji = SUBJECT_EMOJI.get(last_subject, "📁")
+        label = f"✅ Dùng lại: {last_subject} — {last_topic}"
+        if len(label) > 60:
+            label = label[:57] + "..."
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton(label, callback_data="batchreuse_yes")],
+            [InlineKeyboardButton("🆕 Chọn chủ đề khác", callback_data="batchreuse_no")],
+        ])
+        await context.bot.send_message(
+            job.chat_id,
+            f"📥 **Đã nhận {count} ảnh/file cùng lúc!**\n\n"
+            f"💡 Bạn vừa lưu {emoji} **{last_subject} — {last_topic}** gần đây.\n"
+            f"Dùng chủ đề này cho cả **{count} ảnh/file** luôn không?",
+            reply_markup=buttons,
+            parse_mode="Markdown",
+        )
+        return
+
+    await context.bot.send_message(
+        job.chat_id,
+        f"📥 **Đã nhận {count} ảnh/file cùng lúc!**\n\n"
+        f"📚 **Bước 1/2:** Chọn **1 Môn Học chung** cho toàn bộ {count} ảnh/file này:",
+        reply_markup=_build_subject_keyboard(prefix="batchsub_"),
+        parse_mode="Markdown",
+    )
+
+
+async def batch_reuse_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý khi bấm 'Dùng lại chủ đề' / 'Chọn chủ đề khác' cho cả lô ảnh."""
+    query = update.callback_query
+    await query.answer()
+
+    items = context.user_data.get("batch_items")
+    if not items:
+        await query.edit_message_text("⚠️ Phiên đã hết hạn, vui lòng gửi lại ảnh/file.")
+        return
+
+    if query.data == "batchreuse_yes":
+        subject = context.user_data.get("last_subject")
+        topic = context.user_data.get("last_topic")
+        doc_ids = await _finish_batch_upload(context, update.effective_chat.id, query.from_user, subject, topic, items)
+
+        await query.edit_message_text(_batch_success_text(subject, topic, doc_ids), parse_mode="Markdown")
+        context.user_data.pop("batch_items", None)
+        context.user_data.pop("batch_stage", None)
+        return
+
+    # batchreuse_no -> cho chọn môn học riêng cho lô này
+    count = len(items)
+    context.user_data["batch_stage"] = "select_subject"
+    await query.edit_message_text(
+        f"📚 **Bước 1/2:** Chọn **1 Môn Học chung** cho toàn bộ {count} ảnh/file này:",
+        reply_markup=_build_subject_keyboard(prefix="batchsub_"),
+        parse_mode="Markdown",
+    )
+
+
+async def batch_subject_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý khi chọn môn học cho cả lô ảnh."""
+    query = update.callback_query
+
+    if context.user_data.get("batch_stage") != "select_subject" or not context.user_data.get("batch_items"):
+        await query.answer("⚠️ Phiên đã hết hạn, vui lòng gửi lại ảnh/file.", show_alert=True)
+        return
+
+    await query.answer()
+    subject = query.data.replace("batchsub_", "")
+    count = len(context.user_data["batch_items"])
+    emoji = SUBJECT_EMOJI.get(subject, "📁")
+
+    context.user_data["batch_subject"] = subject
+    context.user_data["batch_stage"] = "input_topic"
+
+    await query.edit_message_text(
+        f"✅ Môn học: {emoji} **{subject}**\n\n"
+        f"🏷️ **Bước 2/2:** Nhập **1 Tên/Chủ đề chung** cho cả {count} ảnh/file này:",
+        parse_mode="Markdown",
+    )
+
+
+async def batch_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Nhận tên chủ đề chung, lưu TOÀN BỘ ảnh/file trong lô cùng lúc."""
+    if context.user_data.get("batch_stage") != "input_topic":
+        return  # Không phải đang chờ nhập chủ đề cho lô -> để flow khác xử lý
+
+    items = context.user_data.get("batch_items")
+    subject = context.user_data.get("batch_subject")
+    if not items or not subject:
+        context.user_data.pop("batch_stage", None)
+        return
+
+    topic = update.message.text.strip()
+    doc_ids = await _finish_batch_upload(context, update.effective_chat.id, update.message.from_user, subject, topic, items)
+
+    await update.message.reply_text(_batch_success_text(subject, topic, doc_ids), parse_mode="Markdown")
+
+    context.user_data.pop("batch_items", None)
+    context.user_data.pop("batch_subject", None)
+    context.user_data.pop("batch_stage", None)
+
+    # Chặn không cho ConversationHandler cũng xử lý tin nhắn text này
+    raise ApplicationHandlerStop
+
+
+async def _finish_batch_upload(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user, subject: str, topic: str, items: list) -> list:
+    """Lưu TOÀN BỘ file trong 1 lô vào DB cùng 1 chủ đề, trả về danh sách ID đã tạo."""
+    topic_clean = unidecode(topic).lower()
+    user_name = user.first_name or user.username or "Người dùng"
+    doc_ids = []
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        for item in items:
+            cursor.execute("""
+                INSERT INTO documents (message_id, chat_id, user_id, user_name, subject, topic, topic_clean, file_type, file_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (item["message_id"], chat_id, user.id, user_name, subject, topic, topic_clean, item["file_type"], item["file_id"]))
+            doc_ids.append(cursor.lastrowid)
+
+    # Ghi nhớ chủ đề để gợi ý dùng lại cho lần upload tiếp theo (đơn hoặc theo lô)
+    context.user_data["last_subject"] = subject
+    context.user_data["last_topic"] = topic
+    context.user_data["last_topic_time"] = time.time()
+
+    return doc_ids
+
+
+def _batch_success_text(subject: str, topic: str, doc_ids: list) -> str:
+    """Tạo tin nhắn xác nhận đẹp sau khi lưu cả lô ảnh/file."""
+    emoji = SUBJECT_EMOJI.get(subject, "📁")
+    minutes = REUSE_TOPIC_WINDOW // 60
+    id_range = f"{doc_ids[0]}–{doc_ids[-1]}" if len(doc_ids) > 1 else str(doc_ids[0])
+    return (
+        f"🎉 **ĐÃ LƯU {len(doc_ids)} FILE THÀNH CÔNG!**\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🆔 **ID:** `{id_range}`\n"
+        f"{emoji} **Môn:** {subject}\n"
+        f"🏷️ **Chủ đề:** {topic}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"💡 *File tiếp theo trong {minutes} phút, bot sẽ gợi ý dùng lại chủ đề này ngay!*"
+    )
 
 
 # ==============================================================================
@@ -790,7 +1018,19 @@ def main():
     # Đăng ký CallbackQuery Handlers
     app.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^(delconfirm_|delyes_|delcancel)"))
 
-    # Đăng ký ConversationHandler
+    # --- Xử lý UPLOAD THEO LÔ (nhiều ảnh/file gửi cùng lúc) ---
+    # Đăng ký ở group=-1 để chạy TRƯỚC ConversationHandler (group mặc định = 0):
+    # route_media_group sẽ "chặn" (ApplicationHandlerStop) các ảnh thuộc 1 album,
+    # không cho ConversationHandler hỏi chủ đề riêng từng ảnh.
+    app.add_handler(
+        MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO, route_media_group),
+        group=-1
+    )
+    app.add_handler(CallbackQueryHandler(batch_reuse_callback, pattern=r"^batchreuse_"), group=-1)
+    app.add_handler(CallbackQueryHandler(batch_subject_callback, pattern=r"^batchsub_"), group=-1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, batch_topic_message), group=-1)
+
+    # Đăng ký ConversationHandler (upload đơn lẻ — chạy sau, ở group=0)
     app.add_handler(upload_handler)
 
     logger.info("🤖 Bot Lưu Trữ Tài Liệu đã sẵn sàng hoạt động!")
