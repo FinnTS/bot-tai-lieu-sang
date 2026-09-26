@@ -28,7 +28,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Lấy Token từ biến môi trường hoặc thay trực tiếp token của bạn vào đây
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+# .strip() để loại bỏ khoảng trắng/newline thừa nếu dán nhầm vào Render Environment
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE").strip()
 DB_NAME = "documents.db"
 
 # Các trạng thái của ConversationHandler khi Upload
