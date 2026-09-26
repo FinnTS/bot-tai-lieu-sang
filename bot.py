@@ -1,12 +1,13 @@
 import os
 import re
+import time
 import sqlite3
 import logging
 from contextlib import contextmanager
 from typing import List, Tuple, Optional
 from unidecode import unidecode
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -33,7 +34,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE").strip()
 DB_NAME = "documents.db"
 
 # Các trạng thái của ConversationHandler khi Upload
-SELECT_SUBJECT, INPUT_TOPIC = range(2)
+SELECT_SUBJECT, INPUT_TOPIC, CONFIRM_REUSE = range(3)
+
+# Thời gian (giây) mà bot còn "nhớ" chủ đề vừa lưu để gợi ý dùng lại
+# cho các file upload liên tiếp — tránh phải gõ lại chủ đề nhiều lần
+REUSE_TOPIC_WINDOW = 15 * 60  # 15 phút
 
 # Danh sách các môn học hỗ trợ
 SUBJECTS = [
@@ -41,6 +46,27 @@ SUBJECTS = [
     "Ngữ Văn", "Lịch Sử", "Địa Lý", "Tiếng Anh",
     "Tin Học", "GDCD / KTPL", "Khác"
 ]
+
+# Emoji riêng cho từng môn học, dùng để tin nhắn trực quan hơn
+SUBJECT_EMOJI = {
+    "Toán": "🧮", "Vật Lý": "⚛️", "Hóa Học": "🧪", "Sinh Học": "🧬",
+    "Ngữ Văn": "📖", "Lịch Sử": "🏛️", "Địa Lý": "🌍", "Tiếng Anh": "🇬🇧",
+    "Tin Học": "💻", "GDCD / KTPL": "⚖️", "Khác": "📦",
+}
+
+# Emoji + tên hiển thị riêng cho từng loại file
+FILE_TYPE_META = {
+    "document": ("📄", "Tài liệu"),
+    "photo": ("🖼️", "Ảnh"),
+    "video": ("🎥", "Video"),
+    "audio": ("🎵", "Audio"),
+    "voice": ("🎙️", "Voice"),
+    "canva": ("🎨", "Canva"),
+    "link": ("🔗", "Link"),
+}
+
+# Giới hạn số kết quả gửi file trực tiếp trong 1 lần /tim, tránh spam chat
+MAX_SEND_RESULTS = 30
 
 
 # ==============================================================================
@@ -135,8 +161,11 @@ def run_search(query_raw: str) -> List[Tuple]:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 **Xin chào! Tôi là Bot Lưu Trữ & Tìm Kiếm Tài Liệu.**\n\n"
-        "📥 **Cách upload:** Bạn chỉ cần gửi/chuyển tiếp File, Ảnh, Video, Audio, Voice hoặc link Canva vào đây.\n"
-        "🔍 **Cách tìm kiếm:** Dùng lệnh `/tim <từ khóa>` (VD: `/tim de thi giua ky`)\n"
+        "📥 **Cách upload:** Gửi/chuyển tiếp File, Ảnh, Video, Audio, Voice hoặc bất kỳ link nào "
+        "(Canva, Drive, YouTube...) vào đây.\n"
+        "🔁 *Upload nhiều file cùng chủ đề? Bot sẽ tự gợi ý dùng lại, khỏi gõ lại nhiều lần!*\n\n"
+        "🔍 **Cách tìm kiếm:** Dùng lệnh `/tim <từ khóa>` (VD: `/tim de thi giua ky`) — "
+        "bot gửi luôn TOÀN BỘ ảnh/file liên quan.\n"
         "📜 Gõ `/help` để xem danh sách đầy đủ các lệnh.",
         parse_mode="Markdown"
     )
@@ -146,8 +175,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "📖 **DANH SÁCH LỆNH HỖ TRỢ**\n\n"
         "📂 **Lưu trữ & Tìm kiếm:**\n"
-        "• Gửi File/Ảnh/Canva link: Tải tài liệu lên kho\n"
-        "• `/tim <từ khóa>`: Tìm kiếm tài liệu theo chủ đề/tên\n"
+        "• Gửi File/Ảnh/Video/Audio/Voice/Link bất kỳ: Tải tài liệu lên kho\n"
+        "• `/tim <từ khóa>`: Tìm & gửi HẾT ảnh/file liên quan ngay lập tức\n"
         "• `/list [tên môn]`: Xem danh sách tài liệu (hoặc lọc theo môn)\n"
         "• `/mytai`: Xem danh sách tài liệu do bạn đã tải lên\n\n"
         "🛠️ **Quản lý tài liệu:**\n"
@@ -155,7 +184,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/xoa <từ khóa>`: Tìm và chọn tài liệu cần xóa\n\n"
         "📊 **Khác:**\n"
         "• `/stats`: Xem thống kê kho tài liệu\n"
-        "• `/cancel`: Hủy thao tác hiện tại"
+        "• `/cancel`: Hủy thao tác hiện tại\n\n"
+        "💡 **Mẹo:** Upload nhiều file liên tiếp cùng 1 chủ đề? Bot sẽ tự nhớ và gợi ý "
+        "\"Dùng lại chủ đề vừa rồi?\" — chỉ cần bấm 1 nút!"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -163,6 +194,66 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==============================================================================
 # 5. QUY TRÌNH UPLOAD TÀI LIỆU (CONVERSATION HANDLER)
 # ==============================================================================
+def _build_subject_keyboard() -> InlineKeyboardMarkup:
+    """Tạo bàn phím chọn môn học, có emoji cho trực quan."""
+    buttons = []
+    row = []
+    for idx, sub in enumerate(SUBJECTS, start=1):
+        emoji = SUBJECT_EMOJI.get(sub, "📁")
+        row.append(InlineKeyboardButton(f"{emoji} {sub}", callback_data=f"sub_{sub}"))
+        if idx % 2 == 0:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+
+def _clear_upload_temp(user_data: dict) -> None:
+    """Xóa dữ liệu tạm của lượt upload hiện tại, KHÔNG xóa 'last_subject/last_topic'
+    vì những key đó dùng để gợi ý dùng lại chủ đề cho lần upload tiếp theo."""
+    for key in ("upload_file_type", "upload_file_id", "upload_msg_id",
+                "upload_caption", "upload_subject"):
+        user_data.pop(key, None)
+
+
+async def _finish_upload(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user, subject: str, topic: str):
+    """Lưu tài liệu vào DB, ghi nhớ chủ đề vừa dùng, và trả về (doc_id, text thông báo đẹp)."""
+    topic_clean = unidecode(topic).lower()
+    user_name = user.first_name or user.username or "Người dùng"
+
+    file_type = context.user_data.get("upload_file_type")
+    file_id = context.user_data.get("upload_file_id")
+    msg_id = context.user_data.get("upload_msg_id")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO documents (message_id, chat_id, user_id, user_name, subject, topic, topic_clean, file_type, file_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (msg_id, chat_id, user.id, user_name, subject, topic, topic_clean, file_type, file_id))
+        doc_id = cursor.lastrowid
+
+    # Ghi nhớ chủ đề vừa lưu để gợi ý "dùng lại" cho file tiếp theo
+    context.user_data["last_subject"] = subject
+    context.user_data["last_topic"] = topic
+    context.user_data["last_topic_time"] = time.time()
+
+    emoji = SUBJECT_EMOJI.get(subject, "📁")
+    minutes = REUSE_TOPIC_WINDOW // 60
+    text = (
+        f"🎉 **ĐÃ LƯU TÀI LIỆU THÀNH CÔNG!**\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🆔 **ID:** `{doc_id}`\n"
+        f"{emoji} **Môn:** {subject}\n"
+        f"🏷️ **Chủ đề:** {topic}\n"
+        f"👤 **Người đăng:** {user_name}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"💡 *Gửi file tiếp theo trong {minutes} phút, bot sẽ gợi ý dùng lại chủ đề này ngay!*"
+    )
+    return doc_id, text
+
+
 async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Nhận file/link và khởi động quy trình upload."""
     message = update.message
@@ -184,9 +275,11 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     elif message.voice:
         file_type = "voice"
         file_id = message.voice.file_id
-    elif message.text and "canva.com" in message.text:
-        file_type = "canva"
-        match = re.search(r'https?://[^\s]*canva\.com[^\s]*', message.text)
+    elif message.text and re.search(r'https?://[^\s]+', message.text):
+        # Hỗ trợ link bất kỳ (Canva được nhận diện riêng để hiển thị emoji 🎨,
+        # các link khác — Drive, YouTube, web... — vẫn được lưu bình thường)
+        file_type = "canva" if "canva.com" in message.text else "link"
+        match = re.search(r'https?://[^\s]+', message.text)
         file_id = match.group(0) if match else message.text
     else:
         await message.reply_text("⚠️ Định dạng không được hỗ trợ!")
@@ -198,20 +291,59 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     context.user_data["upload_msg_id"] = message.message_id
     context.user_data["upload_caption"] = message.caption or ""
 
-    # Tạo bàn phím chọn Môn học
-    buttons = []
-    row = []
-    for idx, sub in enumerate(SUBJECTS, start=1):
-        row.append(InlineKeyboardButton(sub, callback_data=f"sub_{sub}"))
-        if idx % 2 == 0:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
+    # Nếu vừa lưu 1 chủ đề gần đây (trong khoảng REUSE_TOPIC_WINDOW),
+    # gợi ý dùng lại luôn để tránh gõ lại nhiều lần
+    last_subject = context.user_data.get("last_subject")
+    last_topic = context.user_data.get("last_topic")
+    last_time = context.user_data.get("last_topic_time")
+
+    if last_subject and last_topic and last_time and (time.time() - last_time) <= REUSE_TOPIC_WINDOW:
+        emoji = SUBJECT_EMOJI.get(last_subject, "📁")
+        label = f"✅ Dùng lại: {last_subject} — {last_topic}"
+        if len(label) > 60:
+            label = label[:57] + "..."
+
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton(label, callback_data="reuse_yes")],
+            [InlineKeyboardButton("🆕 Chọn chủ đề khác", callback_data="reuse_no")],
+        ])
+        await message.reply_text(
+            "📥 **Đã nhận file mới!**\n\n"
+            f"💡 Bạn vừa lưu {emoji} **{last_subject} — {last_topic}** gần đây.\n"
+            "Dùng lại chủ đề này luôn không?",
+            reply_markup=buttons,
+            parse_mode="Markdown"
+        )
+        return CONFIRM_REUSE
 
     await message.reply_text(
         "📚 **Bước 1/2:** Chọn **Môn Học** cho tài liệu này:",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=_build_subject_keyboard(),
+        parse_mode="Markdown"
+    )
+    return SELECT_SUBJECT
+
+
+async def confirm_reuse_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Xử lý khi người dùng bấm 'Dùng lại chủ đề' hoặc 'Chọn chủ đề khác'."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "reuse_yes":
+        subject = context.user_data.get("last_subject")
+        topic = context.user_data.get("last_topic")
+        chat_id = update.effective_chat.id
+
+        doc_id, text = await _finish_upload(context, chat_id, query.from_user, subject, topic)
+        await query.edit_message_text(text, parse_mode="Markdown")
+
+        _clear_upload_temp(context.user_data)
+        return ConversationHandler.END
+
+    # reuse_no → hiện bàn phím chọn môn học như bình thường
+    await query.edit_message_text(
+        "📚 **Bước 1/2:** Chọn **Môn Học** cho tài liệu này:",
+        reply_markup=_build_subject_keyboard(),
         parse_mode="Markdown"
     )
     return SELECT_SUBJECT
@@ -224,10 +356,11 @@ async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     selected_sub = query.data.replace("sub_", "")
     context.user_data["upload_subject"] = selected_sub
+    emoji = SUBJECT_EMOJI.get(selected_sub, "📁")
 
     caption = context.user_data.get("upload_caption", "")
     prompt_text = (
-        f"✅ Môn học: **{selected_sub}**\n\n"
+        f"✅ Môn học: {emoji} **{selected_sub}**\n\n"
         f"🏷️ **Bước 2/2:** Nhập **Tên/Chủ đề** cho tài liệu này (VD: *Đề thi học kỳ 1 2024*):"
     )
 
@@ -241,49 +374,59 @@ async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def save_material(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Lưu thông tin tài liệu vào Cơ sở dữ liệu."""
     topic = update.message.text.strip()
-    topic_clean = unidecode(topic).lower()
-
-    user = update.message.from_user
-    user_name = user.first_name or user.username or "Người dùng"
-    user_id = user.id
+    subject = context.user_data.get("upload_subject")
     chat_id = update.effective_chat.id
 
-    subject = context.user_data.get("upload_subject")
-    file_type = context.user_data.get("upload_file_type")
-    file_id = context.user_data.get("upload_file_id")
-    msg_id = context.user_data.get("upload_msg_id")
+    doc_id, text = await _finish_upload(context, chat_id, update.message.from_user, subject, topic)
+    await update.message.reply_text(text, parse_mode="Markdown")
 
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO documents (message_id, chat_id, user_id, user_name, subject, topic, topic_clean, file_type, file_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (msg_id, chat_id, user_id, user_name, subject, topic, topic_clean, file_type, file_id))
-        doc_id = cursor.lastrowid
-
-    await update.message.reply_text(
-        f"🎉 **ĐÃ LƯU TÀI LIỆU THÀNH CÔNG!**\n\n"
-        f"🆔 **ID:** `{doc_id}`\n"
-        f"📚 **Môn:** {subject}\n"
-        f"🏷️ **Chủ đề:** {topic}\n"
-        f"👤 **Người đăng:** {user_name}",
-        parse_mode="Markdown"
-    )
-
-    context.user_data.clear()
+    _clear_upload_temp(context.user_data)
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Hủy thao tác upload."""
-    context.user_data.clear()
+    """Hủy thao tác upload (vẫn giữ 'nhớ chủ đề gần nhất' cho lần sau)."""
+    _clear_upload_temp(context.user_data)
     await update.message.reply_text("❌ Đã hủy thao tác lưu tài liệu.")
     return ConversationHandler.END
 
 
 # ==============================================================================
-# 6. TÌM KIẾM TÀI LIỆU (/tim)
+# 6. TÌM KIẾM TÀI LIỆU (/tim) — gửi HẾT tất cả ảnh & file liên quan
 # ==============================================================================
+def _chunked(items: list, size: int):
+    """Chia 1 danh sách thành các nhóm nhỏ kích thước `size`."""
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def _build_summary_text(query_raw: str, results: List[Tuple], sending_count: int) -> str:
+    """Tạo tin nhắn tóm tắt đẹp: tổng số + phân bố theo môn học."""
+    total = len(results)
+
+    by_subject = {}
+    for doc in results:
+        subject = doc[2]
+        by_subject[subject] = by_subject.get(subject, 0) + 1
+
+    lines = [
+        f"🔍 **KẾT QUẢ CHO** `{query_raw}`",
+        f"📦 Tìm thấy **{total}** tài liệu liên quan:\n",
+    ]
+    for subject, count in sorted(by_subject.items(), key=lambda x: -x[1]):
+        emoji = SUBJECT_EMOJI.get(subject, "📁")
+        lines.append(f"{emoji} **{subject}:** {count} tài liệu")
+
+    lines.append("\n📤 Đang gửi toàn bộ ảnh/file liên quan bên dưới...")
+    if sending_count < total:
+        lines.append(
+            f"\n⚠️ *Chỉ gửi {sending_count}/{total} kết quả đầu (giới hạn chống spam). "
+            f"Hãy thu hẹp từ khóa để tìm chính xác hơn.*"
+        )
+
+    return "\n".join(lines)
+
+
 async def search_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("⚠️ Cú pháp: `/tim <từ khóa>` (Ví dụ: `/tim hoa 12`)", parse_mode="Markdown")
@@ -296,83 +439,80 @@ async def search_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🔍 Không tìm thấy tài liệu nào khớp với từ khóa: `{query_raw}`")
         return
 
-    # Lưu kết quả vào bot_data với key dọn dẹp bộ nhớ đệm đơn giản
-    if "search_cache" not in context.bot_data:
-        context.bot_data["search_cache"] = {}
+    chat_id = update.effective_chat.id
+    send_list = results[:MAX_SEND_RESULTS]
 
-    cache_key = f"{update.effective_user.id}_{int(update.message.date.timestamp())}"
-    context.bot_data["search_cache"][cache_key] = results
+    # 1) Tin nhắn tóm tắt đẹp, gửi trước
+    await update.message.reply_text(
+        _build_summary_text(query_raw, results, len(send_list)),
+        parse_mode="Markdown"
+    )
 
-    await send_results_page(update, context, cache_key, page=1)
+    # 2) Gom các mục theo loại file
+    photos = []      # sẽ gửi thành album (media group)
+    others = []      # document/video/audio/voice — gửi riêng từng cái
+    link_items = []  # canva + link bất kỳ — gom lại gửi chung 1 tin nhắn
 
-
-async def send_results_page(update: Update, context: ContextTypes.DEFAULT_TYPE, cache_key: str, page: int):
-    results = context.bot_data.get("search_cache", {}).get(cache_key, [])
-
-    if not results:
-        msg = "⚠️ Kết quả tìm kiếm đã hết hạn. Vui lòng thực hiện lại lệnh `/tim`."
-        if update.callback_query:
-            await update.callback_query.answer(msg, show_alert=True)
+    for doc in send_list:
+        doc_id, user_name, subject, topic, file_type, file_id, msg_id, doc_chat_id = doc
+        if file_type == "photo":
+            photos.append(doc)
+        elif file_type in ("canva", "link"):
+            link_items.append(doc)
         else:
-            await update.message.reply_text(msg)
-        return
+            others.append(doc)
 
-    per_page = 5
-    total_items = len(results)
-    total_pages = (total_items + per_page - 1) // per_page
-    page = max(1, min(page, total_pages))
+    failed = 0
 
-    start_idx = (page - 1) * per_page
-    end_idx = start_idx + per_page
-    page_items = results[start_idx:end_idx]
+    # 3) Gửi ảnh theo từng album tối đa 10 ảnh/lần (giới hạn của Telegram)
+    for group in _chunked(photos, 10):
+        media_group = []
+        for doc in group:
+            doc_id, user_name, subject, topic, file_type, file_id, msg_id, doc_chat_id = doc
+            emoji = SUBJECT_EMOJI.get(subject, "📁")
+            caption = f"{emoji} #{doc_id} • {subject}\n🏷️ {topic}"
+            media_group.append(InputMediaPhoto(media=file_id, caption=caption))
+        try:
+            await context.bot.send_media_group(chat_id, media_group)
+        except TelegramError as e:
+            failed += len(group)
+            logger.warning(f"Không thể gửi album ảnh: {e}")
 
-    text = f"🔍 **KẾT QUẢ TÌM KIẾM** (Trang {page}/{total_pages} - Tổng {total_items}):\n\n"
-
-    for doc in page_items:
-        doc_id, user_name, subject, topic, file_type, file_id, msg_id, chat_id = doc
-        text += f"📌 **ID {doc_id}:** [{subject}] {topic}\n👤 *Đăng bởi:* {user_name}\n\n"
-
-        # Gửi file trực tiếp
+    # 4) Gửi các loại file khác, từng cái một, caption đẹp
+    for doc in others:
+        doc_id, user_name, subject, topic, file_type, file_id, msg_id, doc_chat_id = doc
+        emoji, label = FILE_TYPE_META.get(file_type, ("📎", "File"))
+        subj_emoji = SUBJECT_EMOJI.get(subject, "📁")
+        caption = f"{emoji} **{label} #{doc_id}**\n{subj_emoji} {subject} • {topic}\n👤 {user_name}"
         try:
             if file_type == "document":
-                await context.bot.send_document(update.effective_chat.id, file_id, caption=f"📄 ID: {doc_id} | {topic}")
-            elif file_type == "photo":
-                await context.bot.send_photo(update.effective_chat.id, file_id, caption=f"🖼️ ID: {doc_id} | {topic}")
+                await context.bot.send_document(chat_id, file_id, caption=caption, parse_mode="Markdown")
             elif file_type == "video":
-                await context.bot.send_video(update.effective_chat.id, file_id, caption=f"🎥 ID: {doc_id} | {topic}")
+                await context.bot.send_video(chat_id, file_id, caption=caption, parse_mode="Markdown")
             elif file_type == "audio":
-                await context.bot.send_audio(update.effective_chat.id, file_id, caption=f"🎵 ID: {doc_id} | {topic}")
+                await context.bot.send_audio(chat_id, file_id, caption=caption, parse_mode="Markdown")
             elif file_type == "voice":
-                await context.bot.send_voice(update.effective_chat.id, file_id, caption=f"🎙️ ID: {doc_id} | {topic}")
-            elif file_type == "canva":
-                await context.bot.send_message(update.effective_chat.id, f"🎨 **Canva Link (ID {doc_id}):** {topic}\n🔗 {file_id}")
+                await context.bot.send_voice(chat_id, file_id, caption=caption, parse_mode="Markdown")
         except TelegramError as e:
-            logger.warning(f"Không thể gửi trực tiếp file ID {doc_id}: {e}")
+            failed += 1
+            logger.warning(f"Không thể gửi file ID {doc_id}: {e}")
 
-    # Nút chuyển trang
-    nav_buttons = []
-    if page > 1:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Trước", callback_data=f"timpage_{cache_key}_{page-1}"))
-    if page < total_pages:
-        nav_buttons.append(InlineKeyboardButton("Sau ➡️", callback_data=f"timpage_{cache_key}_{page+1}"))
+    # 5) Gom link (Canva + link bất kỳ) thành 1 tin nhắn duy nhất, gọn gàng
+    if link_items:
+        lines = ["🔗 **LINK LIÊN QUAN:**\n"]
+        for doc in link_items:
+            doc_id, user_name, subject, topic, file_type, file_id, msg_id, doc_chat_id = doc
+            type_emoji, _ = FILE_TYPE_META.get(file_type, ("🔗", "Link"))
+            subj_emoji = SUBJECT_EMOJI.get(subject, "📁")
+            lines.append(f"{type_emoji} #{doc_id} • {subj_emoji} {subject} • {topic}\n{file_id}\n")
+        try:
+            await context.bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+        except TelegramError as e:
+            failed += len(link_items)
+            logger.warning(f"Không thể gửi danh sách link: {e}")
 
-    markup = InlineKeyboardMarkup([nav_buttons]) if nav_buttons else None
-
-    if update.callback_query:
-        await update.callback_query.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
-
-
-async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    parts = query.data.split("_")
-    cache_key = parts[1]
-    page = int(parts[2])
-
-    await send_results_page(update, context, cache_key, page)
+    if failed:
+        await update.message.reply_text(f"⚠️ Có {failed} file gửi không thành công (có thể đã bị Telegram thu hồi).")
 
 
 # ==============================================================================
@@ -398,7 +538,8 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = f"📜 **DANH SÁCH TÀI LIỆU MỚI NHẤT** {f'({filter_sub})' if filter_sub else ''}:\n\n"
     for doc_id, subject, topic, user_name in rows:
-        text += f"• `{doc_id}` | **[{subject}]** {topic} *(bởi {user_name})*\n"
+        emoji = SUBJECT_EMOJI.get(subject, "📁")
+        text += f"{emoji} `#{doc_id}` **[{subject}]** {topic} *(bởi {user_name})*\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -416,7 +557,8 @@ async def my_materials(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = "📂 **TÀI LIỆU CỦA BẠN:**\n\n"
     for doc_id, subject, topic in rows:
-        text += f"• `{doc_id}` | **[{subject}]** {topic}\n"
+        emoji = SUBJECT_EMOJI.get(subject, "📁")
+        text += f"{emoji} `#{doc_id}` **[{subject}]** {topic}\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -586,7 +728,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [f"📊 **THỐNG KÊ KHO TÀI LIỆU (Tổng: {total_docs} tài liệu)**\n"]
     for subject, count in by_subject:
-        lines.append(f"• **{subject}:** {count} tài liệu")
+        emoji = SUBJECT_EMOJI.get(subject, "📁")
+        lines.append(f"{emoji} **{subject}:** {count} tài liệu")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -594,22 +737,38 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==============================================================================
 # 11. HÀM MAIN & ĐĂNG KÝ HANDLERS
 # ==============================================================================
+async def post_init(application):
+    """
+    Chạy 1 lần ngay sau khi Application khởi tạo, trước khi bắt đầu polling.
+    Chủ động xóa mọi webhook cũ và pending updates để tránh lỗi
+    'Conflict: terminated by other getUpdates request' khi có instance
+    cũ chưa kịp giải phóng phiên getUpdates với Telegram.
+    """
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Đã xóa webhook cũ (nếu có) và bỏ qua các update đang chờ.")
+    except TelegramError as e:
+        logger.warning(f"⚠️ Không thể xóa webhook cũ: {e}")
+
+
 def main():
     if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE" or not BOT_TOKEN:
         logger.error("❌ Vui lòng cấu hình BOT_TOKEN hợp lệ trong file code hoặc môi trường!")
         return
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     # ConversationHandler cho Upload tài liệu
     upload_handler = ConversationHandler(
         entry_points=[
             MessageHandler(
-                filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Regex(r'https?://[^\s]*canva\.com[^\s]*'),
+                filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE
+                | (filters.TEXT & filters.Regex(r'https?://[^\s]+')),
                 start_upload
             )
         ],
         states={
+            CONFIRM_REUSE: [CallbackQueryHandler(confirm_reuse_callback, pattern=r"^reuse_")],
             SELECT_SUBJECT: [CallbackQueryHandler(subject_selected, pattern=r"^sub_")],
             INPUT_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_material)],
         },
@@ -629,14 +788,23 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
 
     # Đăng ký CallbackQuery Handlers
-    app.add_handler(CallbackQueryHandler(search_page_callback, pattern=r"^timpage_"))
     app.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^(delconfirm_|delyes_|delcancel)"))
 
     # Đăng ký ConversationHandler
     app.add_handler(upload_handler)
 
     logger.info("🤖 Bot Lưu Trữ Tài Liệu đã sẵn sàng hoạt động!")
-    app.run_polling(drop_pending_updates=True)
+    try:
+        app.run_polling(drop_pending_updates=True)
+    except TelegramError as e:
+        if "Conflict" in str(e):
+            logger.error(
+                "❌ Có một instance khác của bot đang chạy cùng BOT_TOKEN này "
+                "(có thể ở máy khác, service Render khác, hoặc webhook cũ chưa xóa). "
+                "Hãy dừng hết các instance khác rồi khởi động lại."
+            )
+        else:
+            raise
 
 
 if __name__ == "__main__":
