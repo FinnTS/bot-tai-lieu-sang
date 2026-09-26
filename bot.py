@@ -1,272 +1,662 @@
 import logging
+import os
 import sqlite3
-import re
-from telegram import Update
+import asyncio
+from contextlib import contextmanager
+from datetime import datetime
+
+from dotenv import load_dotenv
+from unidecode import unidecode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatMemberStatus, ChatType
+from telegram.error import TelegramError
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
-    filters
+    ConversationHandler,
+    filters,
 )
 
-# ----------------------------------------------------
-# 1. CẤU HÌNH BAN ĐẦU & CƠ SỞ DỮ LIỆU
-# ----------------------------------------------------
-TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"  # Thay TOKEN bot của bạn vào đây
-ADMIN_IDS = [123456789]  # Thay ID Telegram của Admin vào đây
+# ------------------------------------------------------------------
+# CẤU HÌNH
+# ------------------------------------------------------------------
+load_dotenv()  # Đọc biến môi trường từ file .env
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DB_PATH = os.getenv("DB_PATH", "learning_materials.db")
+RESULTS_PER_PAGE = 5  # Số tài liệu hiển thị mỗi trang khi /tim hoặc /list
+
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "Chưa tìm thấy BOT_TOKEN. Hãy tạo file .env hoặc cài đặt biến môi trường "
+        "với dòng: BOT_TOKEN=xxxxxxxx:yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+    )
 
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
+logger = logging.getLogger(__name__)
 
-def init_db():
-    conn = sqlite3.connect("documents.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS docs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            category TEXT,
-            link_or_file_id TEXT NOT NULL,
-            type TEXT CHECK(type IN ('link', 'file', 'photo')) NOT NULL,
-            created_by INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
+# ------------------------------------------------------------------
+# DATABASE
+# ------------------------------------------------------------------
 
-def remove_accents(input_str: str) -> str:
-    """Hàm bỏ dấu tiếng Việt để phục vụ tìm kiếm thông minh."""
-    s1 = u'ÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚÝàáâãèéêìíòóôõùúýĂăĐđĨĩŨũƠơƯưẠạẢảẤấẦầẨẩẪẫẬậẮắẰằẲẳẴẵẶặẸẹẺẻẼẽẾếỀềỂểỄễỆệỈỉỊịỌọỎỏỐốỒồỔổỖỗỘộỚớỜờỞởỠỡỢợỤụỦủỨứỪừỬửỮữỰựỲỳỴỵỶỷỸỹ'
-    s0 = u'AAAAEEEIIOOOOUUYaaaaeeeiioooouuyAaDdIiUuOoUuAaAaAaAaAaAaAaAaAaAaAaAaEeEeEeEeEeEeEeEeIiIiOoOoOoOoOoOoOoOoOoOoOoOoUuUuUuUuUuUuUuYyYyYyYy'
-    s = ''
-    for char in input_str:
-        if char in s1:
-            s += s0[s1.index(char)]
-        else:
-            s += char
-    return s.lower()
-
-# ----------------------------------------------------
-# 2. CÁC HÀM XỬ LÝ LỆNH (HANDLERS)
-# ----------------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "👋 Chào mừng bạn đến với Bot Quản Lý Tài Liệu Học Tập!\n\n"
-        "Các lệnh khả dụng:\n"
-        "🔹 /addlink <Tên tài liệu> | <Link Canva/Drive> - Lưu đường dẫn\n"
-        "🔹 Gửi file/ảnh trực tiếp kèm caption: `#add <Tên tài liệu>` - Lưu file\n"
-        "🔹 /search <Từ khóa> - Tìm kiếm tài liệu\n"
-        "🔹 /list - Xem toàn bộ tài liệu\n"
-        "🔹 /delete <ID> - Xóa tài liệu (Chỉ Admin)\n"
-        "🔹 /stats - Thống kê tài liệu\n"
-    )
-    await update.message.reply_text(msg)
-
-async def add_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lưu đường dẫn (Canva, Drive, web...)"""
-    text = " ".join(context.args)
-    if "|" not in text:
-        await update.message.reply_text("⚠️ Vui lòng nhập đúng định dạng:\n`/addlink <Tên tài liệu> | <Link>`", parse_mode="Markdown")
-        return
-
-    title, link = map(str.strip, text.split("|", 1))
-    user_id = update.effective_user.id
-
-    conn = sqlite3.connect("documents.db")
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO docs (title, link_or_file_id, type, created_by) VALUES (?, ?, 'link', ?)",
-        (title, link, user_id)
-    )
-    doc_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-
-    await update.message.reply_text(f"✅ Đã lưu link thành công! (ID: `{doc_id}`)\n📌 *{title}*", parse_mode="Markdown")
-
-async def add_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lưu file tài liệu hoặc ảnh khi người dùng gửi kèm caption #add <Tên>"""
-    caption = update.message.caption
-    if not caption or not caption.startswith("#add"):
-        return
-
-    title = caption.replace("#add", "").strip()
-    if not title:
-        title = "Tài liệu không tên"
-
-    user_id = update.effective_user.id
-    doc_type = 'file'
-    file_id = None
-
-    if update.message.document:
-        file_id = update.message.document.file_id
-        doc_type = 'file'
-    elif update.message.photo:
-        file_id = update.message.photo[-1].file_id
-        doc_type = 'photo'
-
-    if file_id:
-        conn = sqlite3.connect("documents.db")
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO docs (title, link_or_file_id, type, created_by) VALUES (?, ?, ?, ?)",
-            (title, file_id, doc_type, user_id)
-        )
-        doc_id = cursor.lastrowid
+@contextmanager
+def get_db():
+    """Context manager mở/đóng kết nối SQLite an toàn."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        yield conn
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
 
-        await update.message.reply_text(f"✅ Đã lưu {doc_type} thành công! (ID: `{doc_id}`)\n📌 *{title}*", parse_mode="Markdown")
 
-async def search_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Tìm kiếm thông minh hỗ trợ tiếng Việt có dấu và không dấu."""
-    query = " ".join(context.args).strip()
-    if not query:
-        await update.message.reply_text("⚠️ Vui lòng nhập từ khóa tìm kiếm: `/search <từ khóa>`", parse_mode="Markdown")
+def init_db():
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                user_name TEXT,
+                subject TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                topic_clean TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                telegram_file_id TEXT,
+                canva_link TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_topic_clean ON documents(topic_clean)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_subject ON documents(subject)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_id ON documents(user_id)')
+
+
+init_db()
+
+# Các trạng thái luồng Upload
+SELECT_SUBJECT, INPUT_TOPIC = range(2)
+
+# Danh sách các môn học
+SUBJECTS = ["Toán", "Vật Lý", "Hóa Học", "Tin Học", "Tiếng Anh", "Lịch Sử", "Địa Lý", "Văn Học", "Khác"]
+
+FILE_TYPE_EMOJI = {
+    "document": "📄",
+    "photo": "🖼️",
+    "video": "🎬",
+    "audio": "🎵",
+    "voice": "🎙️",
+    "canva": "🎨",
+}
+
+# ----------------- HÀM TIỆN ÍCH -----------------
+
+def build_subject_keyboard():
+    keyboard, row = [], []
+    for sub in SUBJECTS:
+        row.append(InlineKeyboardButton(sub, callback_data=f"sub_{sub}"))
+        if len(row) == 3:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_pagination_keyboard(prefix: str, query_key: str, page: int, total_pages: int):
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton("⬅️ Trước", callback_data=f"{prefix}_{query_key}_{page-1}"))
+    if page < total_pages - 1:
+        buttons.append(InlineKeyboardButton("Sau ➡️", callback_data=f"{prefix}_{query_key}_{page+1}"))
+    return InlineKeyboardMarkup([buttons]) if buttons else None
+
+
+async def is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    chat = update.effective_chat
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return False
+    try:
+        member = await context.bot.get_chat_member(chat.id, user_id)
+        return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    except TelegramError as e:
+        logger.warning(f"Không kiểm tra được quyền admin: {e}")
+        return False
+
+
+# ----------------- LỆNH BẮT ĐẦU / TRỢ GIÚP -----------------
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 **Chào mừng đến với Bot Lưu Trữ Tài Liệu Học Tập!**\n\n"
+        "📥 Thả File / Ảnh / Video / Audio / Link Canva vào nhóm để lưu.\n"
+        "🔍 Gõ `/tim <từ khóa>` để tìm tài liệu.\n"
+        "📖 Gõ `/help` để xem hướng dẫn đầy đủ.",
+        parse_mode="Markdown",
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🤖 **HƯỚNG DẪN SỬ DỤNG BOT NHÓM**\n\n"
+        "1️⃣ **Lưu tài liệu:**\n"
+        "   - Thả **File (PDF/Word/ZIP)**, **Ảnh**, **Video**, **Audio/Voice** hoặc **Link Canva** vào nhóm.\n"
+        "   - Chọn **Môn học** từ menu nút bấm.\n"
+        "   - Reply tin nhắn của bot để nhập tên Bài học/Chủ đề.\n\n"
+        "2️⃣ **Tìm kiếm tài liệu:**\n"
+        "   - Cú pháp: `/tim <từ khóa>`\n"
+        "   - Hỗ trợ gõ từ khóa ngắn, không dấu hoặc có dấu.\n"
+        "   - *Ví dụ:* `/tim chiến dịch` hoặc `/tim dien bien phu`\n\n"
+        "3️⃣ **Liệt kê theo môn:**\n"
+        "   - Cú pháp: `/list <tên môn>` (hoặc `/list all` để xem tất cả)\n\n"
+        "4️⃣ **Xem tài liệu của bạn:**\n"
+        "   - Cú pháp: `/mytai`\n\n"
+        "5️⃣ **Sửa tên chủ đề:**\n"
+        "   - Cú pháp: `/sua <id> <tên mới>` (chỉ chủ bài hoặc Admin)\n"
+        "   - ID lấy được từ kết quả `/tim` hoặc `/list`\n\n"
+        "6️⃣ **Xóa tài liệu:**\n"
+        "   - Cú pháp: `/xoa <từ khóa>`\n"
+        "   - Chọn file từ menu, sau đó xác nhận xóa.\n"
+        "   - *(Chỉ người upload bài đó hoặc Admin nhóm mới có quyền xóa)*\n\n"
+        "7️⃣ **Thống kê nhóm:**\n"
+        "   - Cú pháp: `/stats`\n"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ----------------- LUỒNG UPLOAD TÀI LIỆU -----------------
+
+async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Khi thành viên gửi File, Ảnh, Video, Audio hoặc Link Canva"""
+    message = update.message
+    user_name = message.from_user.first_name or message.from_user.username or "Thành viên"
+    user_id = message.from_user.id
+
+    context.user_data['user_name'] = user_name
+    context.user_data['user_id'] = user_id
+
+    if message.document:
+        context.user_data['file_id'] = message.document.file_id
+        context.user_data['file_type'] = 'document'
+        context.user_data['canva_link'] = ''
+    elif message.photo:
+        context.user_data['file_id'] = message.photo[-1].file_id
+        context.user_data['file_type'] = 'photo'
+        context.user_data['canva_link'] = ''
+    elif message.video:
+        context.user_data['file_id'] = message.video.file_id
+        context.user_data['file_type'] = 'video'
+        context.user_data['canva_link'] = ''
+    elif message.audio:
+        context.user_data['file_id'] = message.audio.file_id
+        context.user_data['file_type'] = 'audio'
+        context.user_data['canva_link'] = ''
+    elif message.voice:
+        context.user_data['file_id'] = message.voice.file_id
+        context.user_data['file_type'] = 'voice'
+        context.user_data['canva_link'] = ''
+    elif message.text and "canva.com" in message.text:
+        context.user_data['file_id'] = ''
+        context.user_data['file_type'] = 'canva'
+        context.user_data['canva_link'] = message.text.strip()
+    else:
+        return ConversationHandler.END
+
+    await message.reply_text(
+        f"📥 **{user_name}** vừa tải lên tài liệu!\nVui lòng chọn **Môn học** tương ứng:",
+        reply_markup=build_subject_keyboard(),
+        parse_mode="Markdown",
+        reply_to_message_id=message.message_id,
+    )
+    return SELECT_SUBJECT
+
+
+async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    selected_subject = query.data.replace("sub_", "")
+    context.user_data['subject'] = selected_subject
+
+    await query.edit_message_text(
+        f"📚 Môn học: **{selected_subject}**\n\n"
+        f"✏️ Hãy reply tin nhắn này để nhập **Tên chủ đề / Tên bài học**\n"
+        f"(Ví dụ: `Chiến dịch Điện Biên Phủ`, `Đạo hàm`, `Monotonic Stack`):",
+        parse_mode="Markdown",
+    )
+    return INPUT_TOPIC
+
+
+async def save_material(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lưu dữ liệu vào database, cảnh báo nếu chủ đề đã tồn tại trong cùng môn."""
+    raw_topic = update.message.text.strip()
+    clean_topic = unidecode(raw_topic).lower()
+
+    subject = context.user_data.get('subject')
+    file_id = context.user_data.get('file_id')
+    file_type = context.user_data.get('file_type')
+    canva_link = context.user_data.get('canva_link')
+    user_name = context.user_data.get('user_name')
+    user_id = context.user_data.get('user_id')
+
+    if not subject or not file_type:
+        await update.message.reply_text("⚠️ Phiên tải lên đã hết hạn, vui lòng gửi lại tài liệu.")
+        return ConversationHandler.END
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM documents WHERE subject = ? AND topic_clean = ?",
+            (subject, clean_topic),
+        )
+        duplicate = cursor.fetchone()[0] > 0
+
+        cursor.execute('''
+            INSERT INTO documents (user_id, user_name, subject, topic, topic_clean, file_type, telegram_file_id, canva_link)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, user_name, subject, raw_topic, clean_topic, file_type, file_id, canva_link))
+
+    warning = "\n\n⚠️ *Lưu ý: đã có tài liệu khác cùng tên chủ đề trong môn này.*" if duplicate else ""
+
+    await update.message.reply_text(
+        f"✅ **Lưu tài liệu thành công!**\n"
+        f"👤 **Người đăng:** {user_name}\n"
+        f"📚 **Môn:** {subject}\n"
+        f"🏷️ **Bài/Chủ đề:** `{raw_topic}`\n\n"
+        f"💡 *Để tìm lại, chỉ cần gõ:* `/tim {raw_topic}`{warning}",
+        parse_mode="Markdown",
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("❌ Đã hủy quá trình lưu tài liệu.")
+    return ConversationHandler.END
+
+
+# ----------------- LUỒNG TRA CỨU TÀI LIỆU -----------------
+
+def run_search(query_raw: str):
+    query_clean = unidecode(query_raw).lower()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, user_name, subject, topic, file_type, telegram_file_id, canva_link, created_at
+            FROM documents
+            WHERE topic_clean LIKE ? OR lower(subject) LIKE ? OR lower(topic) LIKE ?
+            ORDER BY created_at DESC
+        ''', (f"%{query_clean}%", f"%{query_clean}%", f"%{query_raw.lower()}%"))
+        return cursor.fetchall()
+
+
+async def send_results_page(update_or_query, results, query_key: str, page: int, edit=False):
+    total_pages = max(1, (len(results) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * RESULTS_PER_PAGE
+    chunk = results[start:start + RESULTS_PER_PAGE]
+
+    header = f"🔎 **{len(results)}** kết quả — Trang {page + 1}/{total_pages}"
+    keyboard = build_pagination_keyboard("timpage", query_key, page, total_pages)
+
+    if edit:
+        await update_or_query.edit_message_text(header, parse_mode="Markdown", reply_markup=keyboard)
+        target = update_or_query.message
+    else:
+        target = update_or_query
+        await target.reply_text(header, parse_mode="Markdown", reply_markup=keyboard)
+
+    for doc_id, user_name, subject, topic, file_type, file_id, canva_link, created_at in chunk:
+        emoji = FILE_TYPE_EMOJI.get(file_type, "📎")
+        caption = (
+            f"{emoji} **[ID {doc_id}] {subject}**\n"
+            f"🏷️ {topic}\n"
+            f"👤 Đăng bởi: {user_name}"
+        )
+        try:
+            if file_type == 'document' and file_id:
+                await target.reply_document(document=file_id, caption=caption, parse_mode="Markdown")
+            elif file_type == 'photo' and file_id:
+                await target.reply_photo(photo=file_id, caption=caption, parse_mode="Markdown")
+            elif file_type == 'video' and file_id:
+                await target.reply_video(video=file_id, caption=caption, parse_mode="Markdown")
+            elif file_type == 'audio' and file_id:
+                await target.reply_audio(audio=file_id, caption=caption, parse_mode="Markdown")
+            elif file_type == 'voice' and file_id:
+                await target.reply_voice(voice=file_id, caption=caption, parse_mode="Markdown")
+            elif file_type == 'canva' and canva_link:
+                await target.reply_text(f"{caption}\n🎨 **Link Canva:** {canva_link}", parse_mode="Markdown")
+        except TelegramError as e:
+            logger.error(f"Lỗi gửi file (id={doc_id}): {e}")
+            await target.reply_text(f"⚠️ Không gửi được tài liệu ID {doc_id} (có thể file đã hết hạn).")
+
+
+async def search_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ **Cú pháp chưa đúng!**\n\nHãy gõ: `/tim <tên_bài_hoặc_môn>`\n"
+            "Ví dụ: `/tim chiến dịch` hoặc `/tim dien bien phu` hoặc `/tim lich su`",
+            parse_mode="Markdown",
+        )
         return
 
-    query_no_accent = remove_accents(query)
-
-    conn = sqlite3.connect("documents.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, title, link_or_file_id, type FROM docs")
-    rows = cursor.fetchall()
-    conn.close()
-
-    results = []
-    for doc_id, title, link_or_id, doc_type in rows:
-        if query_no_accent in remove_accents(title):
-            results.append((doc_id, title, link_or_id, doc_type))
+    query_raw = " ".join(context.args).strip()
+    results = run_search(query_raw)
 
     if not results:
-        await update.message.reply_text(f"🔍 Không tìm thấy tài liệu nào khớp với từ khóa: *{query}*", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"🔍 Không tìm thấy tài liệu nào trùng với từ khóa: `{query_raw}`", parse_mode="Markdown"
+        )
         return
 
-    msg = f"🔍 *Kết quả tìm kiếm cho '{query}':*\n\n"
-    for doc_id, title, link_or_id, doc_type in results:
-        if doc_type == 'link':
-            msg += f"🔹 [{doc_id}] [{title}]({link_or_id})\n"
+    query_key = query_raw.replace(" ", "+")[:50]
+    context.bot_data.setdefault("search_cache", {})[query_key] = results
+    await send_results_page(update.message, results, query_key, page=0)
+
+
+async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, query_key, page = query.data.split("_", 2)
+    results = context.bot_data.get("search_cache", {}).get(query_key)
+    if results is None:
+        await query.edit_message_text("⚠️ Phiên tìm kiếm đã hết hạn, vui lòng tìm lại.")
+        return
+    await send_results_page(query, results, query_key, int(page), edit=True)
+
+
+# ----------------- /list VÀ /mytai -----------------
+
+async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        subjects_text = ", ".join(f"`{s}`" for s in SUBJECTS)
+        await update.message.reply_text(
+            f"⚠️ Hãy gõ: `/list <tên môn>` hoặc `/list all`\nCác môn hợp lệ: {subjects_text}",
+            parse_mode="Markdown",
+        )
+        return
+
+    subject_arg = " ".join(context.args).strip()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if subject_arg.lower() == "all":
+            cursor.execute("SELECT subject, topic, id FROM documents ORDER BY subject, topic")
         else:
-            msg += f"🔹 [{doc_id}] *{title}* ({doc_type.upper()}) - Dùng /get_{doc_id} để lấy\n"
-
-    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
-
-async def get_file_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lấy file/ảnh theo lệnh /get_<ID>"""
-    command = update.message.text
-    doc_id = command.replace("/get_", "").strip()
-
-    if not doc_id.isdigit():
-        return
-
-    conn = sqlite3.connect("documents.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT title, link_or_file_id, type FROM docs WHERE id = ?", (int(doc_id),))
-    row = cursor.fetchone()
-    conn.close()
-
-    if not row:
-        await update.message.reply_text("❌ Không tìm thấy tài liệu tương ứng.")
-        return
-
-    title, file_id, doc_type = row
-    if doc_type == 'file':
-        await update.message.reply_document(document=file_id, caption=f"📄 *{title}*", parse_mode="Markdown")
-    elif doc_type == 'photo':
-        await update.message.reply_photo(photo=file_id, caption=f"🖼 *{title}*", parse_mode="Markdown")
-    elif doc_type == 'link':
-        await update.message.reply_text(f"🔗 *{title}*:\n{file_id}", parse_mode="Markdown")
-
-async def list_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect("documents.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, title, link_or_file_id, type FROM docs ORDER BY id DESC LIMIT 20")
-    rows = cursor.fetchall()
-    conn.close()
+            cursor.execute("SELECT subject, topic, id FROM documents WHERE subject = ? ORDER BY topic", (subject_arg,))
+        rows = cursor.fetchall()
 
     if not rows:
-        await update.message.reply_text("📂 Kho tài liệu hiện đang trống.")
+        await update.message.reply_text(f"📭 Chưa có tài liệu nào cho `{subject_arg}`.", parse_mode="Markdown")
         return
 
-    msg = "📚 *Danh sách tài liệu mới nhất:*\n\n"
-    for doc_id, title, link_or_id, doc_type in rows:
-        if doc_type == 'link':
-            msg += f"• `{doc_id}` | [{title}]({link_or_id})\n"
-        else:
-            msg += f"• `{doc_id}` | *{title}* (/get\_{doc_id})\n"
+    lines = [f"📖 **Danh sách tài liệu — {subject_arg}**\n"]
+    for subject, topic, doc_id in rows:
+        # Sửa thành rf-string để không bị SyntaxWarning
+        lines.append(rf"• [{doc_id}] {topic}" + (f" ({subject})" if subject_arg.lower() == "all" else ""))
 
-    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3500):
+        await update.message.reply_text(text[i:i + 3500], parse_mode="Markdown")
 
-async def delete_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        await update.message.reply_text("🚫 Bạn không có quyền thực hiện lệnh này.")
+
+async def my_materials(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, subject, topic FROM documents WHERE user_id = ? ORDER BY created_at DESC",
+            (user_id,),
+        )
+        rows = cursor.fetchall()
+
+    if not rows:
+        await update.message.reply_text("📭 Bạn chưa đăng tài liệu nào.")
         return
 
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("⚠️ Cú pháp: `/delete <ID_tài_liệu>`", parse_mode="Markdown")
+    lines = ["🗂️ **Tài liệu bạn đã đăng:**\n"] + [f"• [{i}] {t} ({s})" for i, s, t in rows]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ----------------- SỬA TÊN CHỦ ĐỀ -----------------
+
+async def edit_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "⚠️ Cú pháp: `/sua <id> <tên mới>`\nLấy ID từ kết quả `/tim` hoặc `/list`.",
+            parse_mode="Markdown",
+        )
         return
 
-    doc_id = int(context.args[0])
-    conn = sqlite3.connect("documents.db")
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM docs WHERE id = ?", (doc_id,))
-    affected = cursor.rowcount
-    conn.commit()
-    conn.close()
+    try:
+        doc_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID phải là số. Ví dụ: `/sua 12 Đạo hàm nâng cao`", parse_mode="Markdown")
+        return
 
-    if affected > 0:
-        await update.message.reply_text(f"🗑 Đã xóa tài liệu ID `{doc_id}` thành công!", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("❌ Không tìm thấy ID tài liệu này.")
+    new_topic = " ".join(context.args[1:]).strip()
+    user_id = update.message.from_user.id
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect("documents.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*), type FROM docs GROUP BY type")
-    rows = cursor.fetchall()
-    conn.close()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, topic FROM documents WHERE id = ?", (doc_id,))
+        doc = cursor.fetchone()
 
-    stat_dict = {doc_type: count for count, doc_type in rows}
-    total = sum(stat_dict.values())
+        if not doc:
+            await update.message.reply_text("❌ Không tìm thấy tài liệu với ID này.")
+            return
 
-    msg = (
-        "📊 *Thống kê hệ thống tài liệu:*\n\n"
-        f"🌐 Đường dẫn (Links): {stat_dict.get('link', 0)}\n"
-        f"📄 Tập tin (Documents): {stat_dict.get('file', 0)}\n"
-        f"🖼 Hình ảnh (Photos): {stat_dict.get('photo', 0)}\n"
-        f"---------------------\n"
-        f"📦 *Tổng cộng:* {total} tài liệu"
+        owner_id, old_topic = doc
+        if user_id != owner_id and not await is_group_admin(update, context, user_id):
+            await update.message.reply_text("🚫 Chỉ người đăng bài hoặc Admin nhóm mới có quyền sửa.")
+            return
+
+        clean_topic = unidecode(new_topic).lower()
+        cursor.execute(
+            "UPDATE documents SET topic = ?, topic_clean = ? WHERE id = ?",
+            (new_topic, clean_topic, doc_id),
+        )
+
+    await update.message.reply_text(
+        f"✏️ Đã đổi tên: `{old_topic}` ➜ `{new_topic}`", parse_mode="Markdown"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
 
-# ----------------------------------------------------
-# 3. CHƯƠNG TRÌNH CHÍNH
-# ----------------------------------------------------
+
+# ----------------- LUỒNG XÓA TÀI LIỆU (có xác nhận) -----------------
+
+async def delete_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ **Cú pháp chưa đúng!**\n\nHãy gõ: `/xoa <từ_khóa_tài_liệu>`\n"
+            "Ví dụ: `/xoa đao ham` hoặc `/xoa dien bien phu`",
+            parse_mode="Markdown",
+        )
+        return
+
+    query_raw = " ".join(context.args).strip()
+    query_clean = unidecode(query_raw).lower()
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, subject, topic, user_name
+            FROM documents
+            WHERE topic_clean LIKE ? OR lower(subject) LIKE ? OR lower(topic) LIKE ?
+        ''', (f"%{query_clean}%", f"%{query_clean}%", f"%{query_raw.lower()}%"))
+        results = cursor.fetchall()
+
+    if not results:
+        await update.message.reply_text(f"🔍 Không tìm thấy tài liệu nào trùng với từ khóa: `{query_raw}`", parse_mode="Markdown")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(f"🗑️ [{subject}] {topic} (bởi {user_name})", callback_data=f"delask_{doc_id}")]
+        for doc_id, subject, topic, user_name in results
+    ]
+    await update.message.reply_text(
+        "🗑️ Chọn tài liệu muốn **XÓA** bên dưới:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+    )
+
+
+async def delete_ask_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    doc_id = int(query.data.replace("delask_", ""))
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT subject, topic FROM documents WHERE id = ?", (doc_id,))
+        doc = cursor.fetchone()
+
+    if not doc:
+        await query.edit_message_text("❌ Tài liệu này không còn tồn tại trên hệ thống!")
+        return
+
+    subject, topic = doc
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Xác nhận xóa", callback_data=f"del_{doc_id}"),
+        InlineKeyboardButton("↩️ Hủy", callback_data="delcancel"),
+    ]])
+    await query.edit_message_text(
+        f"⚠️ Bạn có chắc muốn xóa:\n**[{subject}] {topic}**?",
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+    )
+
+
+async def delete_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("↩️ Đã hủy thao tác xóa.")
+
+
+async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    doc_id = int(query.data.replace("del_", ""))
+    user_id = query.from_user.id
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, topic, subject FROM documents WHERE id = ?", (doc_id,))
+        doc = cursor.fetchone()
+
+        if not doc:
+            await query.edit_message_text("❌ Tài liệu này không còn tồn tại trên hệ thống!")
+            return
+
+        owner_id, topic, subject = doc
+        is_admin = await is_group_admin(update, context, user_id)
+
+        if user_id == owner_id or is_admin:
+            cursor.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+            await query.edit_message_text(f"🗑️ **Đã xóa thành công:** [{subject}] `{topic}`", parse_mode="Markdown")
+        else:
+            await query.edit_message_text(
+                "🚫 **Bạn không có quyền xóa tài liệu này!** (Chỉ người đăng bài hoặc Admin nhóm mới có quyền xóa).",
+                parse_mode="Markdown",
+            )
+
+
+# ----------------- THỐNG KÊ -----------------
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM documents")
+        total = cursor.fetchone()[0]
+
+        cursor.execute("SELECT subject, COUNT(*) FROM documents GROUP BY subject ORDER BY COUNT(*) DESC")
+        by_subject = cursor.fetchall()
+
+        cursor.execute(
+            "SELECT user_name, COUNT(*) as c FROM documents GROUP BY user_id ORDER BY c DESC LIMIT 5"
+        )
+        top_users = cursor.fetchall()
+
+    lines = [f"📊 **THỐNG KÊ TÀI LIỆU NHÓM**\n\n📁 Tổng số: **{total}** tài liệu\n"]
+    if by_subject:
+        lines.append("**Theo môn học:**")
+        lines += [f"  • {subject}: {count}" for subject, count in by_subject]
+    if top_users:
+        lines.append("\n**Top người đóng góp:**")
+        lines += [f"  🏅 {name}: {count} tài liệu" for name, count in top_users]
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ----------------- XỬ LÝ LỖI TOÀN CỤC -----------------
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Lỗi không mong muốn:", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ Đã có lỗi xảy ra, vui lòng thử lại sau."
+            )
+        except TelegramError:
+            pass
+
+
+# ----------------- CHƯƠNG TRÌNH CHÍNH -----------------
+
 def main():
-    init_db()
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Đăng ký các handler
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("addlink", add_link))
-    app.add_handler(CommandHandler("search", search_doc))
-    app.add_handler(CommandHandler("list", list_all))
-    app.add_handler(CommandHandler("delete", delete_doc))
-    app.add_handler(CommandHandler("stats", stats))
-    
-    # Handler nhận file / ảnh gửi trực tiếp
-    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, add_file))
-    
-    # Handler bắt lệnh /get_<ID>
-    app.add_handler(MessageHandler(filters.Regex(r"^/get_\d+$"), get_file_by_id))
+    upload_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(
+                filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE,
+                start_upload,
+            ),
+            MessageHandler(filters.TEXT & filters.Regex(r'canva\.com'), start_upload),
+        ],
+        states={
+            SELECT_SUBJECT: [CallbackQueryHandler(subject_selected, pattern=r"^sub_")],
+            INPUT_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_material)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+
+    app.add_handler(upload_handler)
+    app.add_handler(CommandHandler('start', start_command))
+    app.add_handler(CommandHandler('help', help_command))
+    app.add_handler(CommandHandler('tim', search_topic))
+    app.add_handler(CommandHandler('list', list_command))
+    app.add_handler(CommandHandler('mytai', my_materials))
+    app.add_handler(CommandHandler('sua', edit_topic))
+    app.add_handler(CommandHandler('xoa', delete_search))
+    app.add_handler(CommandHandler('stats', stats_command))
+
+    app.add_handler(CallbackQueryHandler(search_page_callback, pattern=r"^timpage_"))
+    app.add_handler(CallbackQueryHandler(delete_ask_confirm, pattern=r"^delask_"))
+    app.add_handler(CallbackQueryHandler(delete_cancel, pattern=r"^delcancel$"))
+    app.add_handler(CallbackQueryHandler(delete_confirm, pattern=r"^del_"))
+
+    app.add_error_handler(error_handler)
 
     print("🤖 Bot Telegram đã bắt đầu chạy...")
     app.run_polling()
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
+    # Sửa lỗi 'RuntimeError: There is no current event loop in thread' trên Python 3.14+
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     main()
