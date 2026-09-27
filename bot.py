@@ -3,6 +3,8 @@ import re
 import time
 import sqlite3
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from contextlib import contextmanager
 from typing import List, Tuple, Optional
 from unidecode import unidecode
@@ -19,6 +21,35 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import TelegramError
+
+# ==============================================================================
+# 0. HTTP SERVER GIẢ (chỉ để Render Web Service thấy có cổng mở)
+# ==============================================================================
+# Render Free plan chỉ hỗ trợ loại service "Web Service" chạy free (loại
+# "Background Worker" đúng bản chất cho bot thì tốn phí). Web Service bắt
+# buộc phải bind $PORT, nếu không Render sẽ liên tục khởi động lại/spawn
+# thêm instance mới trong khi instance cũ (đang polling Telegram) vẫn còn
+# sống — gây lỗi "Conflict: terminated by other getUpdates request".
+# Server này không phục vụ chức năng gì cho bot, chỉ để Render thấy "còn sống".
+def _run_fake_http_server():
+    port = int(os.getenv("PORT", "10000"))
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot dang chay OK")
+
+        def log_message(self, format, *args):
+            pass  # tắt log HTTP để đỡ rác log chính
+
+    try:
+        server = HTTPServer(("0.0.0.0", port), _Handler)
+        logger.info(f"🌐 Đã mở cổng giả {port} để Render nhận diện Web Service.")
+        server.serve_forever()
+    except OSError as e:
+        logger.warning(f"⚠️ Không thể mở cổng {port}: {e}")
+
 
 # ==============================================================================
 # 1. CẤU HÌNH BAN ĐẦU & LOGGING
@@ -1016,6 +1047,10 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, batch_topic_message), group=-1)
 
     app.add_handler(upload_handler)
+
+    # Mở cổng giả trong thread nền TRƯỚC khi polling, để Render nhận cổng
+    # ngay từ đầu và không khởi động lại/spawn thêm instance thứ 2.
+    threading.Thread(target=_run_fake_http_server, daemon=True).start()
 
     logger.info("🤖 Bot Lưu Trữ Tài Liệu đã sẵn sàng hoạt động!")
     try:
