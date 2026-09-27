@@ -1,11 +1,13 @@
 import os
 import re
 import time
-import sqlite3
 import logging
 from contextlib import contextmanager
 from typing import List, Tuple, Optional
 from unidecode import unidecode
+
+import psycopg2
+import psycopg2.extras
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
@@ -30,9 +32,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Lấy Token từ biến môi trường hoặc thay trực tiếp token của bạn vào đây
-# .strip() để loại bỏ khoảng trắng/newline thừa nếu dán nhầm vào Render Environment
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE").strip()
-DB_NAME = "documents.db"
+
+# ------------------------------------------------------------------------------
+# QUAN TRỌNG: Render Free plan có filesystem TẠM THỜI — mỗi lần restart/deploy
+# service, mọi file tạo ra lúc chạy (kể cả file SQLite .db) đều bị XÓA SẠCH.
+# Vì Free plan không hỗ trợ Persistent Disk, cách duy nhất để dữ liệu KHÔNG
+# bị mất là chuyển sang PostgreSQL (Render có Free Postgres riêng biệt,
+# tồn tại độc lập với web service nên không bao giờ bị xóa khi service restart).
+#
+# Cách lấy DATABASE_URL:
+# 1. Trong Render Dashboard -> New -> PostgreSQL (chọn Free) -> tạo xong,
+#    Render sẽ cấp cho bạn "Internal Database URL".
+# 2. Vào service Bot của bạn -> Environment -> thêm biến:
+#       DATABASE_URL = <dán Internal Database URL vào đây>
+# ------------------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 # Các trạng thái của ConversationHandler khi Upload
 SELECT_SUBJECT, INPUT_TOPIC, CONFIRM_REUSE = range(3)
@@ -71,12 +86,12 @@ MAX_SEND_RESULTS = 30
 
 
 # ==============================================================================
-# 2. XỬ LÝ CƠ SỞ DỮ LIỆU (SQLITE)
+# 2. XỬ LÝ CƠ SỞ DỮ LIỆU (POSTGRESQL)
 # ==============================================================================
 @contextmanager
 def get_db():
-    """Context manager giúp mở và đóng kết nối DB an toàn."""
-    conn = sqlite3.connect(DB_NAME)
+    """Context manager giúp mở và đóng kết nối DB an toàn (PostgreSQL)."""
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         yield conn
         conn.commit()
@@ -94,25 +109,28 @@ def init_db():
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id INTEGER NOT NULL,
-                chat_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
+                id SERIAL PRIMARY KEY,
+                message_id BIGINT NOT NULL,
+                chat_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
                 user_name TEXT,
                 subject TEXT NOT NULL,
                 topic TEXT NOT NULL,
                 topic_clean TEXT NOT NULL,
                 file_type TEXT NOT NULL,
                 file_id TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_topic_clean ON documents(topic_clean)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_subject ON documents(subject)")
 
 
-# Khởi tạo DB ngay khi khởi động
-init_db()
+# Khởi tạo DB ngay khi khởi động (chỉ khi đã cấu hình DATABASE_URL)
+if DATABASE_URL:
+    init_db()
+else:
+    logger.error("❌ Chưa cấu hình biến môi trường DATABASE_URL! Xem hướng dẫn ở đầu file.")
 
 
 # ==============================================================================
@@ -131,7 +149,7 @@ async def is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, use
         return False
 
 
-def run_search(query_raw: str) -> List[Tuple]:
+def run_search(query_raw: str) -> List[dict]:
     """Tìm kiếm tài liệu trong DB dựa trên từ khóa không dấu."""
     q_clean = unidecode(query_raw).lower().strip()
     keywords = [k for k in q_clean.split() if k]
@@ -139,7 +157,7 @@ def run_search(query_raw: str) -> List[Tuple]:
     if not keywords:
         return []
 
-    conditions = ["topic_clean LIKE ?" for _ in keywords]
+    conditions = ["topic_clean LIKE %s" for _ in keywords]
     where_clause = " AND ".join(conditions)
     params = [f"%{k}%" for k in keywords]
 
@@ -234,9 +252,10 @@ async def _finish_upload(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user,
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO documents (message_id, chat_id, user_id, user_name, subject, topic, topic_clean, file_type, file_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
         """, (msg_id, chat_id, user.id, user_name, subject, topic, topic_clean, file_type, file_id))
-        doc_id = cursor.lastrowid
+        doc_id = cursor.fetchone()["id"]
 
     # Ghi nhớ chủ đề vừa lưu để gợi ý "dùng lại" cho file tiếp theo
     context.user_data["last_subject"] = subject
@@ -398,8 +417,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # ==============================================================================
 # 5B. UPLOAD THEO LÔ (gửi nhiều ảnh/file cùng lúc — hỏi chủ đề 1 LẦN DUY NHẤT)
 # ==============================================================================
-# Thời gian (giây) bot chờ để gom đủ các phần của 1 album trước khi hỏi chủ đề.
-# Telegram thường gửi các ảnh trong cùng 1 album cách nhau chưa tới 1 giây.
 ALBUM_COLLECT_DELAY = 1.5
 
 
@@ -413,7 +430,7 @@ async def route_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     message = update.message
     if not message or not message.media_group_id:
-        return  # Không phải album -> để flow upload đơn xử lý
+        return
 
     if message.document:
         file_type, file_id = "document", message.document.file_id
@@ -435,8 +452,6 @@ async def route_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "message_id": message.message_id,
     })
 
-    # Đặt lại hẹn giờ mỗi khi có thêm 1 phần của album đến, để đảm bảo
-    # đợi đủ TẤT CẢ các phần rồi mới xử lý (tránh xử lý dở dang).
     job_name = f"album_{message.chat_id}_{mgid}"
     if context.job_queue:
         for job in context.job_queue.get_jobs_by_name(job_name):
@@ -450,7 +465,6 @@ async def route_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data={"media_group_id": mgid},
         )
 
-    # Chặn không cho các handler khác (ConversationHandler) xử lý riêng ảnh này
     raise ApplicationHandlerStop
 
 
@@ -470,7 +484,6 @@ async def process_album_job(context: ContextTypes.DEFAULT_TYPE):
     context.user_data["batch_items"] = items
     context.user_data["batch_stage"] = "select_subject"
 
-    # Nếu vừa lưu 1 chủ đề gần đây, gợi ý dùng lại luôn cho CẢ LÔ
     last_subject = context.user_data.get("last_subject")
     last_topic = context.user_data.get("last_topic")
     last_time = context.user_data.get("last_topic_time")
@@ -523,7 +536,6 @@ async def batch_reuse_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("batch_stage", None)
         return
 
-    # batchreuse_no -> cho chọn môn học riêng cho lô này
     count = len(items)
     context.user_data["batch_stage"] = "select_subject"
     await query.edit_message_text(
@@ -559,7 +571,7 @@ async def batch_subject_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def batch_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Nhận tên chủ đề chung, lưu TOÀN BỘ ảnh/file trong lô cùng lúc."""
     if context.user_data.get("batch_stage") != "input_topic":
-        return  # Không phải đang chờ nhập chủ đề cho lô -> để flow khác xử lý
+        return
 
     items = context.user_data.get("batch_items")
     subject = context.user_data.get("batch_subject")
@@ -576,7 +588,6 @@ async def batch_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data.pop("batch_subject", None)
     context.user_data.pop("batch_stage", None)
 
-    # Chặn không cho ConversationHandler cũng xử lý tin nhắn text này
     raise ApplicationHandlerStop
 
 
@@ -591,11 +602,11 @@ async def _finish_batch_upload(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         for item in items:
             cursor.execute("""
                 INSERT INTO documents (message_id, chat_id, user_id, user_name, subject, topic, topic_clean, file_type, file_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
             """, (item["message_id"], chat_id, user.id, user_name, subject, topic, topic_clean, item["file_type"], item["file_id"]))
-            doc_ids.append(cursor.lastrowid)
+            doc_ids.append(cursor.fetchone()["id"])
 
-    # Ghi nhớ chủ đề để gợi ý dùng lại cho lần upload tiếp theo (đơn hoặc theo lô)
     context.user_data["last_subject"] = subject
     context.user_data["last_topic"] = topic
     context.user_data["last_topic_time"] = time.time()
@@ -623,18 +634,16 @@ def _batch_success_text(subject: str, topic: str, doc_ids: list) -> str:
 # 6. TÌM KIẾM TÀI LIỆU (/tim) — gửi HẾT tất cả ảnh & file liên quan
 # ==============================================================================
 def _chunked(items: list, size: int):
-    """Chia 1 danh sách thành các nhóm nhỏ kích thước `size`."""
     for i in range(0, len(items), size):
         yield items[i:i + size]
 
 
-def _build_summary_text(query_raw: str, results: List[Tuple], sending_count: int) -> str:
-    """Tạo tin nhắn tóm tắt đẹp: tổng số + phân bố theo môn học."""
+def _build_summary_text(query_raw: str, results: List[dict], sending_count: int) -> str:
     total = len(results)
 
     by_subject = {}
     for doc in results:
-        subject = doc[2]
+        subject = doc["subject"]
         by_subject[subject] = by_subject.get(subject, 0) + 1
 
     lines = [
@@ -670,69 +679,60 @@ async def search_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     send_list = results[:MAX_SEND_RESULTS]
 
-    # 1) Tin nhắn tóm tắt đẹp, gửi trước
     await update.message.reply_text(
         _build_summary_text(query_raw, results, len(send_list)),
         parse_mode="Markdown"
     )
 
-    # 2) Gom các mục theo loại file
-    photos = []      # sẽ gửi thành album (media group)
-    others = []      # document/video/audio/voice — gửi riêng từng cái
-    link_items = []  # canva + link bất kỳ — gom lại gửi chung 1 tin nhắn
+    photos = []
+    others = []
+    link_items = []
 
     for doc in send_list:
-        doc_id, user_name, subject, topic, file_type, file_id, msg_id, doc_chat_id = doc
-        if file_type == "photo":
+        if doc["file_type"] == "photo":
             photos.append(doc)
-        elif file_type in ("canva", "link"):
+        elif doc["file_type"] in ("canva", "link"):
             link_items.append(doc)
         else:
             others.append(doc)
 
     failed = 0
 
-    # 3) Gửi ảnh theo từng album tối đa 10 ảnh/lần (giới hạn của Telegram)
     for group in _chunked(photos, 10):
         media_group = []
         for doc in group:
-            doc_id, user_name, subject, topic, file_type, file_id, msg_id, doc_chat_id = doc
-            emoji = SUBJECT_EMOJI.get(subject, "📁")
-            caption = f"{emoji} #{doc_id} • {subject}\n🏷️ {topic}"
-            media_group.append(InputMediaPhoto(media=file_id, caption=caption))
+            emoji = SUBJECT_EMOJI.get(doc["subject"], "📁")
+            caption = f"{emoji} #{doc['id']} • {doc['subject']}\n🏷️ {doc['topic']}"
+            media_group.append(InputMediaPhoto(media=doc["file_id"], caption=caption))
         try:
             await context.bot.send_media_group(chat_id, media_group)
         except TelegramError as e:
             failed += len(group)
             logger.warning(f"Không thể gửi album ảnh: {e}")
 
-    # 4) Gửi các loại file khác, từng cái một, caption đẹp
     for doc in others:
-        doc_id, user_name, subject, topic, file_type, file_id, msg_id, doc_chat_id = doc
-        emoji, label = FILE_TYPE_META.get(file_type, ("📎", "File"))
-        subj_emoji = SUBJECT_EMOJI.get(subject, "📁")
-        caption = f"{emoji} **{label} #{doc_id}**\n{subj_emoji} {subject} • {topic}\n👤 {user_name}"
+        emoji, label = FILE_TYPE_META.get(doc["file_type"], ("📎", "File"))
+        subj_emoji = SUBJECT_EMOJI.get(doc["subject"], "📁")
+        caption = f"{emoji} **{label} #{doc['id']}**\n{subj_emoji} {doc['subject']} • {doc['topic']}\n👤 {doc['user_name']}"
         try:
-            if file_type == "document":
-                await context.bot.send_document(chat_id, file_id, caption=caption, parse_mode="Markdown")
-            elif file_type == "video":
-                await context.bot.send_video(chat_id, file_id, caption=caption, parse_mode="Markdown")
-            elif file_type == "audio":
-                await context.bot.send_audio(chat_id, file_id, caption=caption, parse_mode="Markdown")
-            elif file_type == "voice":
-                await context.bot.send_voice(chat_id, file_id, caption=caption, parse_mode="Markdown")
+            if doc["file_type"] == "document":
+                await context.bot.send_document(chat_id, doc["file_id"], caption=caption, parse_mode="Markdown")
+            elif doc["file_type"] == "video":
+                await context.bot.send_video(chat_id, doc["file_id"], caption=caption, parse_mode="Markdown")
+            elif doc["file_type"] == "audio":
+                await context.bot.send_audio(chat_id, doc["file_id"], caption=caption, parse_mode="Markdown")
+            elif doc["file_type"] == "voice":
+                await context.bot.send_voice(chat_id, doc["file_id"], caption=caption, parse_mode="Markdown")
         except TelegramError as e:
             failed += 1
-            logger.warning(f"Không thể gửi file ID {doc_id}: {e}")
+            logger.warning(f"Không thể gửi file ID {doc['id']}: {e}")
 
-    # 5) Gom link (Canva + link bất kỳ) thành 1 tin nhắn duy nhất, gọn gàng
     if link_items:
         lines = ["🔗 **LINK LIÊN QUAN:**\n"]
         for doc in link_items:
-            doc_id, user_name, subject, topic, file_type, file_id, msg_id, doc_chat_id = doc
-            type_emoji, _ = FILE_TYPE_META.get(file_type, ("🔗", "Link"))
-            subj_emoji = SUBJECT_EMOJI.get(subject, "📁")
-            lines.append(f"{type_emoji} #{doc_id} • {subj_emoji} {subject} • {topic}\n{file_id}\n")
+            type_emoji, _ = FILE_TYPE_META.get(doc["file_type"], ("🔗", "Link"))
+            subj_emoji = SUBJECT_EMOJI.get(doc["subject"], "📁")
+            lines.append(f"{type_emoji} #{doc['id']} • {subj_emoji} {doc['subject']} • {doc['topic']}\n{doc['file_id']}\n")
         try:
             await context.bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
         except TelegramError as e:
@@ -753,7 +753,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor = conn.cursor()
         if filter_sub:
             cursor.execute(
-                "SELECT id, subject, topic, user_name FROM documents WHERE subject LIKE ? ORDER BY id DESC LIMIT 20",
+                "SELECT id, subject, topic, user_name FROM documents WHERE subject LIKE %s ORDER BY id DESC LIMIT 20",
                 (f"%{filter_sub}%",)
             )
         else:
@@ -765,9 +765,9 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = f"📜 **DANH SÁCH TÀI LIỆU MỚI NHẤT** {f'({filter_sub})' if filter_sub else ''}:\n\n"
-    for doc_id, subject, topic, user_name in rows:
-        emoji = SUBJECT_EMOJI.get(subject, "📁")
-        text += f"{emoji} `#{doc_id}` **[{subject}]** {topic} *(bởi {user_name})*\n"
+    for row in rows:
+        emoji = SUBJECT_EMOJI.get(row["subject"], "📁")
+        text += f"{emoji} `#{row['id']}` **[{row['subject']}]** {row['topic']} *(bởi {row['user_name']})*\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -776,7 +776,7 @@ async def my_materials(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, subject, topic FROM documents WHERE user_id = ? ORDER BY id DESC", (user_id,))
+        cursor.execute("SELECT id, subject, topic FROM documents WHERE user_id = %s ORDER BY id DESC", (user_id,))
         rows = cursor.fetchall()
 
     if not rows:
@@ -784,9 +784,9 @@ async def my_materials(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = "📂 **TÀI LIỆU CỦA BẠN:**\n\n"
-    for doc_id, subject, topic in rows:
-        emoji = SUBJECT_EMOJI.get(subject, "📁")
-        text += f"{emoji} `#{doc_id}` **[{subject}]** {topic}\n"
+    for row in rows:
+        emoji = SUBJECT_EMOJI.get(row["subject"], "📁")
+        text += f"{emoji} `#{row['id']}` **[{row['subject']}]** {row['topic']}\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -815,21 +815,21 @@ async def edit_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT user_id, subject FROM documents WHERE id = ?", (doc_id,))
+        cursor.execute("SELECT user_id, subject FROM documents WHERE id = %s", (doc_id,))
         row = cursor.fetchone()
 
         if not row:
             await update.message.reply_text(f"❌ Không tìm thấy tài liệu với ID `{doc_id}`.", parse_mode="Markdown")
             return
 
-        owner_id, subject = row
+        owner_id, subject = row["user_id"], row["subject"]
         if owner_id != user_id and not is_admin:
             await update.message.reply_text("⛔ Bạn không có quyền sửa tên tài liệu này (Chỉ chủ sở hữu hoặc Admin).")
             return
 
         new_topic_clean = unidecode(new_topic).lower()
         cursor.execute(
-            "UPDATE documents SET topic = ?, topic_clean = ? WHERE id = ?",
+            "UPDATE documents SET topic = %s, topic_clean = %s WHERE id = %s",
             (new_topic, new_topic_clean, doc_id)
         )
 
@@ -866,10 +866,9 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with get_db() as conn:
         cursor = conn.cursor()
         for doc in results:
-            doc_id = doc[0]
-            cursor.execute("SELECT user_id FROM documents WHERE id = ?", (doc_id,))
+            cursor.execute("SELECT user_id FROM documents WHERE id = %s", (doc["id"],))
             owner = cursor.fetchone()
-            if owner and (owner[0] == user_id or is_admin):
+            if owner and (owner["user_id"] == user_id or is_admin):
                 filtered_results.append(doc)
 
     if not filtered_results:
@@ -877,9 +876,9 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     buttons = []
-    for doc_id, user_name, subject, topic, _, _, _, _ in filtered_results[:10]:
-        btn_text = f"❌ [{subject}] {topic[:20]}"
-        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"delconfirm_{doc_id}")])
+    for doc in filtered_results[:10]:
+        btn_text = f"❌ [{doc['subject']}] {doc['topic'][:20]}"
+        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"delconfirm_{doc['id']}")])
 
     markup = InlineKeyboardMarkup(buttons)
     await update.message.reply_text(
@@ -901,14 +900,14 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc_id = int(data.split("_")[1])
         with get_db() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT topic, subject, user_id FROM documents WHERE id = ?", (doc_id,))
+            cursor.execute("SELECT topic, subject, user_id FROM documents WHERE id = %s", (doc_id,))
             row = cursor.fetchone()
 
             if not row:
                 await query.edit_message_text("❌ Tài liệu không tồn tại hoặc đã bị xóa trước đó.")
                 return
 
-            topic, subject, owner_id = row
+            topic, subject, owner_id = row["topic"], row["subject"], row["user_id"]
             if owner_id != user_id and not is_admin:
                 await query.edit_message_text("⛔ Bạn không có quyền xóa tài liệu này.")
                 return
@@ -930,7 +929,7 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc_id = int(data.split("_")[1])
         with get_db() as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+            cursor.execute("DELETE FROM documents WHERE id = %s", (doc_id,))
 
         await query.edit_message_text(f"✅ Đã xóa thành công tài liệu ID `{doc_id}`!", parse_mode="Markdown")
 
@@ -944,10 +943,10 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM documents")
-        total_docs = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) AS total FROM documents")
+        total_docs = cursor.fetchone()["total"]
 
-        cursor.execute("SELECT subject, COUNT(*) FROM documents GROUP BY subject ORDER BY COUNT(*) DESC")
+        cursor.execute("SELECT subject, COUNT(*) AS cnt FROM documents GROUP BY subject ORDER BY cnt DESC")
         by_subject = cursor.fetchall()
 
     if total_docs == 0:
@@ -955,9 +954,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lines = [f"📊 **THỐNG KÊ KHO TÀI LIỆU (Tổng: {total_docs} tài liệu)**\n"]
-    for subject, count in by_subject:
-        emoji = SUBJECT_EMOJI.get(subject, "📁")
-        lines.append(f"{emoji} **{subject}:** {count} tài liệu")
+    for row in by_subject:
+        emoji = SUBJECT_EMOJI.get(row["subject"], "📁")
+        lines.append(f"{emoji} **{row['subject']}:** {row['cnt']} tài liệu")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -984,9 +983,12 @@ def main():
         logger.error("❌ Vui lòng cấu hình BOT_TOKEN hợp lệ trong file code hoặc môi trường!")
         return
 
+    if not DATABASE_URL:
+        logger.error("❌ Vui lòng cấu hình biến môi trường DATABASE_URL (PostgreSQL) trước khi chạy!")
+        return
+
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # ConversationHandler cho Upload tài liệu
     upload_handler = ConversationHandler(
         entry_points=[
             MessageHandler(
@@ -1005,7 +1007,6 @@ def main():
         per_chat=True,
     )
 
-    # Đăng ký Command Handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("tim", search_topic))
@@ -1015,13 +1016,8 @@ def main():
     app.add_handler(CommandHandler("xoa", delete_command))
     app.add_handler(CommandHandler("stats", stats_command))
 
-    # Đăng ký CallbackQuery Handlers
     app.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^(delconfirm_|delyes_|delcancel)"))
 
-    # --- Xử lý UPLOAD THEO LÔ (nhiều ảnh/file gửi cùng lúc) ---
-    # Đăng ký ở group=-1 để chạy TRƯỚC ConversationHandler (group mặc định = 0):
-    # route_media_group sẽ "chặn" (ApplicationHandlerStop) các ảnh thuộc 1 album,
-    # không cho ConversationHandler hỏi chủ đề riêng từng ảnh.
     app.add_handler(
         MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO, route_media_group),
         group=-1
@@ -1030,7 +1026,6 @@ def main():
     app.add_handler(CallbackQueryHandler(batch_subject_callback, pattern=r"^batchsub_"), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, batch_topic_message), group=-1)
 
-    # Đăng ký ConversationHandler (upload đơn lẻ — chạy sau, ở group=0)
     app.add_handler(upload_handler)
 
     logger.info("🤖 Bot Lưu Trữ Tài Liệu đã sẵn sàng hoạt động!")
