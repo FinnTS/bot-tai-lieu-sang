@@ -3,6 +3,7 @@ import re
 import time
 import sqlite3
 import logging
+import asyncio
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from contextlib import contextmanager
@@ -1003,9 +1004,20 @@ async def post_init(application):
 
 
 def main():
-    if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE" or not BOT_TOKEN:
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
         logger.error("❌ Vui lòng cấu hình BOT_TOKEN hợp lệ trong file code hoặc môi trường!")
         return
+
+    # Python 3.14 đã bỏ hẳn việc tự tạo event loop ngầm (PEP 719). Thư viện
+    # python-telegram-bot (kể cả bản mới) vẫn gọi asyncio.get_event_loop()
+    # theo kiểu cũ bên trong run_polling(), nên trên 3.14 sẽ văng lỗi
+    # "There is no current event loop in thread 'MainThread'". Chủ động tạo
+    # và gán 1 event loop cho thread chính TRƯỚC khi gọi run_polling() để
+    # tránh lỗi này — bất kể sau này Render dùng Python bản nào.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
