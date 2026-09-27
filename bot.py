@@ -41,6 +41,12 @@ def _run_fake_http_server():
             self.end_headers()
             self.wfile.write(b"Bot dang chay OK")
 
+        def do_HEAD(self):
+            # UptimeRobot (và nhiều dịch vụ uptime-check khác) mặc định gửi
+            # HEAD thay vì GET để kiểm tra nhẹ hơn — cần trả 200 cho cả 2.
+            self.send_response(200)
+            self.end_headers()
+
         def log_message(self, format, *args):
             pass  # tắt log HTTP để đỡ rác log chính
 
