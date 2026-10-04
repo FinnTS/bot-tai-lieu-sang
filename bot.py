@@ -860,6 +860,7 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 
 def build_application():
     persistence = PicklePersistence(filepath=PERSISTENCE_NAME, store_data=True)
+    persistence = PicklePersistence(filepath=PERSISTENCE_NAME)
     app = (ApplicationBuilder()
            .token(BOT_TOKEN)
            .persistence(persistence)
