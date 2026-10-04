@@ -916,6 +916,8 @@ def main():
         try:
             logger.info("🤖 Khởi động Telegram bot (polling)...")
             app = build_application()
+            # Python 3.14 no longer creates a current event loop implicitly.
+            asyncio.set_event_loop(asyncio.new_event_loop())
             app.run_polling(
                 poll_interval=1.0,
                 timeout=30,
@@ -937,4 +939,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
