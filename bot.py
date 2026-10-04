@@ -5,7 +5,7 @@ import sqlite3
 import logging
 import asyncio
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from contextlib import contextmanager
 from typing import List, Tuple, Optional
 from unidecode import unidecode
@@ -22,6 +22,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import TelegramError
+from telegram.ext import PicklePersistence
 
 # ==============================================================================
 # 0. HTTP SERVER GIẢ (Xử lý cả GET và HEAD cho UptimeRobot & Render)
@@ -46,7 +47,8 @@ def _run_fake_http_server():
             pass  # Tắt log HTTP để tránh làm rác terminal/console log
 
     try:
-        server = HTTPServer(("0.0.0.0", port), _Handler)
+        server = ThreadingHTTPServer(("0.0.0.0", port), _Handler)
+        server.daemon_threads = True
         logger.info(f"🌐 Đã mở cổng giả {port} để Render nhận diện Web Service & hỗ trợ HEAD request.")
         server.serve_forever()
     except OSError as e:
@@ -65,7 +67,12 @@ logger = logging.getLogger(__name__)
 # Lấy Token từ biến môi trường
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE").strip()
 
-DB_NAME = "documents.db"
+# Đặt DATA_DIR thành thư mục persistent disk của nền tảng (ví dụ /var/data trên Render).
+# Mặc định lưu cạnh file bot; không dùng thư mục tạm nếu cần giữ dữ liệu sau deploy/restart.
+DATA_DIR = os.path.abspath(os.getenv("DATA_DIR", os.path.dirname(__file__)))
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_NAME = os.path.join(DATA_DIR, os.getenv("DB_NAME", "documents.db"))
+PERSISTENCE_NAME = os.path.join(DATA_DIR, "telegram_bot_state.pkl")
 
 # Các trạng thái của ConversationHandler khi Upload
 SELECT_SUBJECT, INPUT_TOPIC, CONFIRM_REUSE = range(3)
@@ -104,7 +111,8 @@ MAX_SEND_RESULTS = 30
 # ==============================================================================
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=30)
+    conn.execute("PRAGMA busy_timeout = 30000")
     try:
         yield conn
         conn.commit()
@@ -119,6 +127,8 @@ def get_db():
 def init_db():
     with get_db() as conn:
         cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS documents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -843,16 +853,21 @@ async def delete_material(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==============================================================================
 # 8. KHỞI CHẠY BOT & REGISTER HANDLERS
 # ==============================================================================
-def main():
-    if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        logger.error("❌ Chưa cấu hình BOT_TOKEN! Hãy thêm biến môi trường BOT_TOKEN.")
-        return
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ghi log lỗi handler để một update lỗi không làm chết tiến trình."""
+    logger.error("Lỗi khi xử lý update %r: %s", update, context.error, exc_info=(type(context.error), context.error, context.error.__traceback__) if context.error else None)
 
-    # 1. Chạy Fake HTTP Server trong Daemon Thread riêng biệt ngay khi bắt đầu
-    threading.Thread(target=_run_fake_http_server, daemon=True).start()
 
-    # 2. Tạo Application Telegram Bot
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+def build_application():
+    persistence = PicklePersistence(filepath=PERSISTENCE_NAME, store_data=True)
+    app = (ApplicationBuilder()
+           .token(BOT_TOKEN)
+           .persistence(persistence)
+           .connect_timeout(30)
+           .read_timeout(30)
+           .write_timeout(30)
+           .pool_timeout(30)
+           .build())
 
     # Handlers cho Album/Media Group (xử lý ưu tiên trước với group=-1)
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.AUDIO, route_media_group), group=-1)
@@ -860,37 +875,65 @@ def main():
     app.add_handler(CallbackQueryHandler(batch_subject_callback, pattern=r"^batchsub_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, batch_topic_message), group=-1)
 
-    # ConversationHandler cho Upload Đơn lẻ
     upload_conv = ConversationHandler(
-        entry_points=[
-            MessageHandler(
-                filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Entity("url"),
-                start_upload
-            )
-        ],
+        entry_points=[MessageHandler(
+            filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Entity("url"),
+            start_upload)],
         states={
             CONFIRM_REUSE: [CallbackQueryHandler(confirm_reuse_callback, pattern=r"^reuse_")],
             SELECT_SUBJECT: [CallbackQueryHandler(subject_selected, pattern=r"^sub_")],
             INPUT_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_material)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        name="upload_conversation",
+        persistent=True,
     )
-
     app.add_handler(upload_conv)
 
-    # Command Handlers
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("tim", search_topic))
-    app.add_handler(CommandHandler("list", list_command))
-    app.add_handler(CommandHandler("mytai", my_materials))
-    app.add_handler(CommandHandler("sua", edit_material))
-    app.add_handler(CommandHandler("xoa", delete_material))
+    for command, callback in [
+        ("start", start_command), ("help", help_command), ("stats", stats_command),
+        ("tim", search_topic), ("list", list_command), ("mytai", my_materials),
+        ("sua", edit_material), ("xoa", delete_material),
+    ]:
+        app.add_handler(CommandHandler(command, callback))
 
-    logger.info("🤖 Telegram Bot đang chạy Polling...")
-    app.run_polling()
+    app.add_error_handler(global_error_handler)
+    return app
+
+
+def main():
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
+        raise RuntimeError("Chưa cấu hình BOT_TOKEN. Hãy đặt BOT_TOKEN trong biến môi trường.")
+
+    threading.Thread(target=_run_fake_http_server, name="health-http", daemon=True).start()
+    retry_delay = 5
+    max_retry_delay = 300
+
+    # PTB tự retry các lỗi polling thông thường. Vòng ngoài này khởi tạo lại app nếu
+    # polling kết thúc do lỗi nghiêm trọng; trạng thái hội thoại được lưu bằng persistence.
+    while True:
+        try:
+            logger.info("🤖 Khởi động Telegram bot (polling)...")
+            app = build_application()
+            app.run_polling(
+                poll_interval=1.0,
+                timeout=30,
+                bootstrap_retries=-1,
+                drop_pending_updates=False,
+                close_loop=True,
+            )
+            # run_polling chỉ kết thúc bình thường khi có yêu cầu dừng; thoát vòng lặp.
+            logger.info("Bot đã dừng theo yêu cầu.")
+            break
+        except KeyboardInterrupt:
+            logger.info("Nhận yêu cầu dừng từ bàn phím.")
+            break
+        except Exception:
+            logger.exception("Bot gặp lỗi nghiêm trọng; sẽ khởi động lại sau %s giây.", retry_delay)
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, max_retry_delay)
 
 
 if __name__ == "__main__":
     main()
+
